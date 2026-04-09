@@ -9,7 +9,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg?style=flat-square)](./LICENSE)
 [![TypeScript](https://img.shields.io/badge/TypeScript-3178C6?style=flat-square&logo=typescript&logoColor=white)](#)
 [![Python](https://img.shields.io/badge/Python-3776AB?style=flat-square&logo=python&logoColor=white)](#)
-[![Lines of Code](https://img.shields.io/badge/~3000_lines-minimal-green?style=flat-square)](#)
+[![Lines of Code](https://img.shields.io/badge/~4300_lines-minimal-green?style=flat-square)](#)
 
 <br/>
 
@@ -27,9 +27,9 @@
 
 **Claude Code 开源了 50 万行 TypeScript。读不动？**
 
-本项目用 **~3000 行代码**（TypeScript + Python 双语言实现）复现了 Claude Code 的核心架构——Agent Loop、工具系统、4 层上下文压缩、记忆系统、技能系统、多 Agent……每一步都对照真实源码讲解"它怎么做的 → 我们怎么简化的"。
+本项目用 **~4300 行代码**（TypeScript + Python 双语言实现）复现了 Claude Code 的核心架构——Agent Loop、13 个工具（含并行执行 + 流式早期启动）、4 层上下文压缩、语义记忆召回、技能系统、多 Agent、MCP 集成……每一步都对照真实源码讲解"它怎么做的 → 我们怎么简化的"。
 
-这不是 demo，是一份**分步教程**——11 章内容，跟着动手写几千行代码，快速理解 Claude Code 这样最好用的 coding agent 的精髓。读完你就理解了 coding agent 的工作原理，无需啃那几十万行代码。
+这不是 demo，是一份**分步教程**——13 章内容，跟着动手写几千行代码，快速理解 Claude Code 这样最好用的 coding agent 的精髓。读完你就理解了 coding agent 的工作原理，无需啃那几十万行代码。
 
 <div align="center">
   <video src="https://github.com/user-attachments/assets/4f6597e2-6ea3-45ae-8a6b-77662c4e9540" width="100%" autoplay loop muted playsinline></video>
@@ -37,21 +37,26 @@
 
 ## 📖 分步教程
 
-11 章内容，从核心循环到进阶能力，每章都贴真实代码 + Claude Code 源码对照。跟着教程动手写，快速掌握 coding agent 核心原理：
+13 章内容，分两个阶段——先构建一个可用的 Coding Agent，再逐步添加进阶能力。每章都贴真实代码 + Claude Code 源码对照：
 
 | 章节 | 内容 | 对应源码 |
 |------|------|---------|
+| **Phase 1: 构建一个可用的 Coding Agent** | | |
 | [1. Agent Loop](https://windy3f3f3f3f.github.io/claude-code-from-scratch/#/docs/01-agent-loop) | 核心循环：调用 LLM → 执行工具 → 重复 | `agent.ts` ↔ `query.ts` |
-| [2. 工具系统](https://windy3f3f3f3f.github.io/claude-code-from-scratch/#/docs/02-tools) | 8 个工具的定义与实现 | `tools.ts` ↔ `Tool.ts` + 66 工具 |
-| [3. System Prompt](https://windy3f3f3f3f.github.io/claude-code-from-scratch/#/docs/03-system-prompt) | 让 LLM 成为合格 agent 的提示词工程 | `prompt.ts` ↔ `prompts.ts` |
-| [4. 流式输出](https://windy3f3f3f3f.github.io/claude-code-from-scratch/#/docs/04-streaming) | Anthropic + OpenAI 双后端流式处理 | `agent.ts` ↔ `api/claude.ts` |
-| [5. 权限与安全](https://windy3f3f3f3f.github.io/claude-code-from-scratch/#/docs/05-safety) | 危险命令检测 + 用户确认机制 | `tools.ts` ↔ `permissions.ts` (52KB) |
-| [6. 上下文管理](https://windy3f3f3f3f.github.io/claude-code-from-scratch/#/docs/06-context) | 结果截断 + 自动对话压缩 | `agent.ts` ↔ `compact/` |
-| [7. CLI 与会话](https://windy3f3f3f3f.github.io/claude-code-from-scratch/#/docs/07-cli-session) | REPL、Ctrl+C、会话持久化 | `cli.ts` ↔ `cli.tsx` |
-| [8. 记忆与技能](https://windy3f3f3f3f.github.io/claude-code-from-scratch/#/docs/08-memory-skills) | 4 类型记忆 + 技能模板系统 | `memory.ts` + `skills.ts` |
-| [9. 多 Agent](https://windy3f3f3f3f.github.io/claude-code-from-scratch/#/docs/09-multi-agent) | Sub-Agent fork-return 多 Agent 架构 | `subagent.ts` ↔ `AgentTool/` |
-| [10. 权限规则](https://windy3f3f3f3f.github.io/claude-code-from-scratch/#/docs/10-permission-rules) | 配置化 allow/deny 权限规则 | `tools.ts` ↔ `permissions/` |
-| [11. 架构对比](https://windy3f3f3f3f.github.io/claude-code-from-scratch/#/docs/11-whats-next) | 完整对比 + 扩展方向 | 全局 |
+| [2. 工具系统](https://windy3f3f3f3f.github.io/claude-code-from-scratch/#/docs/02-tools) | 13 个工具 + mtime 防护 + 延迟加载 | `tools.ts` ↔ `Tool.ts` + 66 工具 |
+| [3. System Prompt](https://windy3f3f3f3f.github.io/claude-code-from-scratch/#/docs/03-system-prompt) | 提示词工程 + @include 语法 | `prompt.ts` ↔ `prompts.ts` |
+| [4. CLI 与会话](https://windy3f3f3f3f.github.io/claude-code-from-scratch/#/docs/04-cli-session) | REPL、Ctrl+C、会话持久化 | `cli.ts` ↔ `cli.tsx` |
+| [5. 流式输出](https://windy3f3f3f3f.github.io/claude-code-from-scratch/#/docs/05-streaming) | 双后端 + 流式工具执行 + 并行执行 | `agent.ts` ↔ `api/claude.ts` |
+| [6. 权限与安全](https://windy3f3f3f3f.github.io/claude-code-from-scratch/#/docs/06-permissions) | 5 模式 + 声明式规则 + 危险检测 | `tools.ts` ↔ `permissions/` (52KB) |
+| [7. 上下文管理](https://windy3f3f3f3f.github.io/claude-code-from-scratch/#/docs/07-context) | 4 层压缩 + 大结果持久化 | `agent.ts` ↔ `compact/` |
+| **Phase 2: 进阶能力** | | |
+| [8. 记忆系统](https://windy3f3f3f3f.github.io/claude-code-from-scratch/#/docs/08-memory) | 4 类型记忆 + 语义召回 + 异步预取 | `memory.ts` ↔ `memory.ts` |
+| [9. 技能系统](https://windy3f3f3f3f.github.io/claude-code-from-scratch/#/docs/09-skills) | 技能发现 + inline/fork 双模式 | `skills.ts` ↔ `SkillTool/` |
+| [10. Plan Mode](https://windy3f3f3f3f.github.io/claude-code-from-scratch/#/docs/10-plan-mode) | 只读规划 + 4 选项审批工作流 | `agent.ts` ↔ `EnterPlanMode` |
+| [11. 多 Agent](https://windy3f3f3f3f.github.io/claude-code-from-scratch/#/docs/11-multi-agent) | Sub-Agent fork-return 多 Agent 架构 | `subagent.ts` ↔ `AgentTool/` |
+| [12. MCP 集成](https://windy3f3f3f3f.github.io/claude-code-from-scratch/#/docs/12-mcp) | JSON-RPC over stdio 连接外部工具 | `mcp.ts` ↔ `mcpClient.ts` |
+| [13. 架构对比](https://windy3f3f3f3f.github.io/claude-code-from-scratch/#/docs/13-whats-next) | 完整对比 + 扩展方向 | 全局 |
+| [14. 功能测试](https://windy3f3f3f3f.github.io/claude-code-from-scratch/#/docs/14-testing) | 19 项手动测试覆盖全部功能 | `test/` |
 
 ## 🚀 快速开始
 
@@ -161,27 +166,31 @@ mini-claude-py               # 直接启动
 | 维度 | Claude Code | Mini Claude Code |
 |------|------------|-----------------|
 | 定位 | 生产级编程智能体 | 教学 / 最小可用实现 |
-| 工具数量 | 66+ 内置工具 | 8 个工具（6 核心 + skill + agent） |
-| 上下文管理 | 4 级压缩流水线 | 4 层压缩（budget + snip + microcompact + auto-compact） |
-| 权限系统 | 7 层 + AST 分析 | 5 种模式 + 规则配置 + 正则检测 |
-| 编辑验证 | 14 步流水线 | 引号容错 + 唯一性 + diff 输出 |
-| 记忆系统 | 4 类型 + 语义召回 | 4 类型 + 关键词召回 |
+| 工具数量 | 66+ 内置工具 | 13 个工具（6 核心 + web_fetch + tool_search + skill + agent + plan mode） |
+| 工具执行 | 并发 + streaming 早期启动 | 并行执行 + streaming 早期启动 |
+| 上下文管理 | 4 级压缩流水线 | 4 层压缩 + 大结果持久化（>30KB） |
+| 权限系统 | 7 层 + AST 分析 | 5 种模式 + 声明式规则 + 正则检测 |
+| 编辑验证 | 14 步流水线 | 引号容错 + 唯一性 + mtime 防护 + diff 输出 |
+| 记忆系统 | 4 类型 + 语义召回 | 4 类型 + 语义召回 + 异步预取 |
 | 技能系统 | 6 源 + inline/fork | 2 源 + inline/fork |
-| 多 Agent | Sub-Agent + 自定义 + Coordinator + Swarm | Sub-Agent（3 内置 + 自定义 Agent） |
+| 多 Agent | Sub-Agent + Coordinator + Swarm | Sub-Agent（3 内置 + 自定义 Agent） |
+| MCP 集成 | mcpClient.ts + 动态工具发现 | McpManager + JSON-RPC over stdio |
 | 预算控制 | USD/轮次/abort 三维 | USD + 轮次限制 |
-| 代码量 | 50 万+ 行 | ~3000 行 |
+| 代码量 | 50 万+ 行 | ~4300 行（TS）/ ~3800 行（Python） |
 
 ## ⚡ 核心能力
 
 - **Agent 循环**：自动调用工具、处理结果、持续迭代，直到任务完成
-- **8 个工具**：读文件、写文件、编辑代码（引号容错 + diff 输出）、搜索文件、搜索内容、执行命令、技能调用、子 Agent
-- **流式输出**：逐字实时显示，Anthropic + OpenAI 双后端
-- **4 层上下文压缩**：budget 截断 → stale snip → microcompact → auto-compact，零 API 成本逐级释放空间
-- **5 种权限模式**：default / plan / acceptEdits / bypassPermissions / dontAsk
-- **记忆系统**：4 类型（user/feedback/project/reference）跨会话记忆
+- **13 个工具**：读写编辑文件（mtime 防护）、搜索、Shell、WebFetch、ToolSearch（延迟加载）、技能、子 Agent、Plan Mode
+- **流式输出**：逐字实时显示，Anthropic + OpenAI 双后端，streaming 工具早期执行
+- **并行工具执行**：只读工具（read_file、grep_search 等）自动并发，2-3x 加速
+- **4 层上下文压缩**：budget 截断 → stale snip → microcompact → auto-compact + 大结果持久化（>30KB 写磁盘）
+- **权限系统**：5 种模式 + `.claude/settings.json` 声明式 allow/deny 规则 + 16 个危险命令正则
+- **记忆系统**：4 类型记忆 + 语义召回（sideQuery 调模型选择相关记忆）+ 异步预取
 - **技能系统**：`.claude/skills/` 目录加载，支持 inline 注入和 fork 子 Agent 两种执行模式
 - **多 Agent**：Sub-Agent fork-return 模式（3 内置类型 + `.claude/agents/` 自定义类型）
-- **权限规则**：`.claude/settings.json` 配置化 allow/deny 规则，16 个危险命令正则（含 Windows）
+- **MCP 集成**：JSON-RPC over stdio 连接外部工具服务器，动态工具发现与调用转发
+- **System Prompt**：@include 语法递归引入、.claude/rules/ 自动加载、模板变量替换
 - **Extended Thinking**：支持 Anthropic 扩展思考（`--thinking`），adaptive/enabled/disabled 三模式
 - **预算控制**：`--max-cost` 费用限制 + `--max-turns` 轮次限制，超限自动停止
 - **会话持久化**：自动保存对话，`--resume` 恢复上次会话
@@ -192,25 +201,26 @@ mini-claude-py               # 直接启动
 
 ```
 src/                # TypeScript 版
-├── agent.ts        # Agent 循环：流式、4 层压缩、预算、子 Agent  (1064 行)
-├── tools.ts        # 工具：8 工具 + 5 权限模式 + 引号容错 + diff (667 行)
-├── cli.ts          # CLI 入口：参数解析、REPL、预算 flags        (336 行)
-├── memory.ts       # 记忆系统：4 类型 + 文件存储 + 关键词召回    (205 行)
-├── ui.ts           # 终端输出：彩色显示、格式化、子 Agent 显示   (187 行)
-├── skills.ts       # 技能系统：目录发现 + inline/fork 双模式     (175 行)
-├── subagent.ts     # 子 Agent：3 内置 + 自定义 Agent 发现        (172 行)
-├── system-prompt.md # 系统提示词模板                             (81 行)
-├── prompt.ts       # System Prompt：模板 + 记忆/技能/Agent 注入  (76 行)
-├── session.ts      # 会话持久化：保存/恢复/列表                  (63 行)
-├── frontmatter.ts  # 共享 YAML frontmatter 解析器               (41 行)
-                                                    总计: ~3067 行
+├── agent.ts        # Agent 循环：流式、并行执行、4 层压缩、预算   (1501 行)
+├── tools.ts        # 工具：13 工具 + mtime 防护 + 延迟加载       (858 行)
+├── cli.ts          # CLI 入口：参数解析、REPL、预算 flags         (371 行)
+├── memory.ts       # 记忆系统：4 类型 + 语义召回 + 异步预取       (376 行)
+├── mcp.ts          # MCP 客户端：JSON-RPC over stdio             (266 行)
+├── prompt.ts       # System Prompt：@include + 模板 + 注入       (230 行)
+├── ui.ts           # 终端输出：彩色显示、格式化、子 Agent 显示    (211 行)
+├── subagent.ts     # 子 Agent：3 内置 + 自定义 Agent 发现         (199 行)
+├── skills.ts       # 技能系统：目录发现 + inline/fork 双模式      (175 行)
+├── session.ts      # 会话持久化：保存/恢复/列表                   (63 行)
+├── frontmatter.ts  # 共享 YAML frontmatter 解析器                (41 行)
+                                                    总计: ~4291 行
 
 python/             # Python 版（功能一致）
 ├── mini_claude/
 │   ├── agent.py, tools.py, __main__.py, ui.py, prompt.py,
-│   ├── session.py, memory.py, skills.py, subagent.py, frontmatter.py
+│   ├── session.py, memory.py, skills.py, subagent.py,
+│   ├── mcp_client.py, frontmatter.py
 │   └── system_prompt.md
-└── pyproject.toml                                  总计: ~2678 行
+└── pyproject.toml                                  总计: ~3811 行
 ```
 
 ## 🏗️ 架构图

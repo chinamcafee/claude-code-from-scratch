@@ -1,4 +1,4 @@
-# 9. 多 Agent 架构
+# 11. 多 Agent 架构
 
 ## 本章目标
 
@@ -569,3 +569,5 @@ General Agent 工具列表里过滤掉了 `agent`。不限制的话，A 创建 B
 ---
 
 整个实现的核心洞察：**子 Agent 本质上就是一个配置不同的 Agent 实例**。通过给 Agent 类添加少量可选参数（`customTools`、`customSystemPrompt`、`isSubAgent`），同一套 agent loop 同时服务于主 Agent 和子 Agent，避免了代码重复。
+
+> **下一章**：让 Agent 连接外部工具服务器——MCP 集成。

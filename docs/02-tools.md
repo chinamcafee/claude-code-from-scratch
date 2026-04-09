@@ -2,7 +2,7 @@
 
 ## 本章目标
 
-定义 6 个核心工具（读文件、写文件、编辑文件、列文件、搜索、Shell）+ 4 个扩展工具（skill、agent、enter_plan_mode、exit_plan_mode），让 LLM 能真正操作你的代码库。
+定义 6 个核心工具（读文件、写文件、编辑文件、列文件、搜索、Shell）+ 5 个扩展工具（skill、agent、web_fetch、tool_search、plan mode），让 LLM 能真正操作你的代码库。实现编辑防护（read-before-edit + mtime 检查）和延迟加载（deferred tools）机制。
 
 ```mermaid
 graph LR
@@ -15,8 +15,10 @@ graph LR
     Dispatch --> RS[run_shell]
     Dispatch --> SK[skill]
     Dispatch --> AG[agent]
-    Dispatch --> EP[enter_plan_mode]
-    Dispatch --> XP[exit_plan_mode]
+    Dispatch --> WEB[web_fetch]
+    Dispatch --> TS[tool_search]
+    Dispatch --> EP[enter_plan_mode<br/>deferred]
+    Dispatch --> XP[exit_plan_mode<br/>deferred]
     RF --> Result[工具结果字符串]
     WF --> Result
     EF --> Result
@@ -25,6 +27,8 @@ graph LR
     RS --> Result
     SK --> Result
     AG --> Result
+    WEB --> Result
+    TS --> Result
     EP --> Result
     XP --> Result
 
@@ -597,7 +601,7 @@ def _run_shell(inp: dict) -> str:
 
 失败时同时返回 stdout 和 stderr——很多编译器在 stderr 输出错误的同时，stdout 可能有有用的部分输出。`"(no output)"` 避免模型在命令成功但无输出时（`mkdir`、`touch`）产生困惑。
 
-Claude Code 的 BashTool 分布在 18 个源文件中，有 AST 解析命令、沙箱执行、23 个安全检查。我们只做 timeout 保护（安全机制在第 5 章详述）。
+Claude Code 的 BashTool 分布在 18 个源文件中，有 AST 解析命令、沙箱执行、23 个安全检查。我们只做 timeout 保护（安全机制在第 6 章详述）。
 
 ### 工具结果截断
 
@@ -634,16 +638,201 @@ def _truncate_result(result: str) -> str:
 
 保留头尾而非只保留头部，因为很多命令的关键输出在末尾（编译错误摘要、测试结果统计）。截断提示明确告知模型内容被截断，模型可据此决定是否用 `grep_search` 或 `read_file` 获取完整内容。
 
+### WebFetch 工具
+
+让 Agent 能访问 URL 获取内容——查文档、读 API 响应、抓取网页信息：
+
+<!-- tabs:start -->
+#### **TypeScript**
+```typescript
+// tools.ts — web_fetch 定义
+{
+  name: "web_fetch",
+  description: "Fetch a URL and return its content as text. For HTML pages, tags are stripped.",
+  input_schema: {
+    type: "object",
+    properties: {
+      url: { type: "string", description: "The URL to fetch" },
+      max_length: { type: "number", description: "Maximum content length (default 50000)" },
+    },
+    required: ["url"],
+  },
+}
+
+// tools.ts — web_fetch 执行
+case "web_fetch": {
+  const url = input.url as string;
+  const maxLength = (input.max_length as number) || 50000;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 30000);
+  try {
+    const res = await fetch(url, {
+      signal: controller.signal,
+      headers: { "User-Agent": "mini-claude/1.0" },
+    });
+    clearTimeout(timeout);
+    if (!res.ok) { result = `HTTP error: ${res.status} ${res.statusText}`; break; }
+    let text = await res.text();
+    if (contentType.includes("html")) {
+      // 去掉 script/style 标签，HTML 标签转空格，处理 HTML 实体
+      text = text
+        .replace(/<script[\s\S]*?<\/script>/gi, "")
+        .replace(/<style[\s\S]*?<\/style>/gi, "")
+        .replace(/<[^>]*>/g, " ")
+        .replace(/&nbsp;/g, " ").replace(/&amp;/g, "&")
+        .replace(/\s{2,}/g, " ").replace(/\n{3,}/g, "\n\n").trim();
+    }
+    if (text.length > maxLength) {
+      text = text.slice(0, maxLength) + `\n\n[... truncated at ${maxLength} characters]`;
+    }
+    result = text || "(empty response)";
+  } catch (err: any) {
+    clearTimeout(timeout);
+    result = err.name === "AbortError"
+      ? "Error: Request timed out (30s)"
+      : `Error fetching ${url}: ${err.message}`;
+  }
+  break;
+}
+```
+<!-- tabs:end -->
+
+设计选择：
+- **30 秒超时**：防止模型访问慢速或无响应的 URL 时阻塞整个循环
+- **HTML 去标签**：LLM 不需要看 HTML 标签，纯文本更高效
+- **50KB 上限**：避免网页内容挤占上下文窗口
+- 标记为 `CONCURRENCY_SAFE_TOOLS`（只读、无副作用），可并行执行
+
+### Read-before-edit + mtime 防护
+
+Claude Code 的一个重要安全机制：**编辑文件前必须先读取**。这防止模型在不了解文件当前内容的情况下盲目修改，同时检测外部修改避免覆盖用户的手动编辑。
+
+<!-- tabs:start -->
+#### **TypeScript**
+```typescript
+// tools.ts — executeTool 中的 mtime 追踪
+
+export async function executeTool(
+  name: string,
+  input: Record<string, any>,
+  readFileState?: Map<string, number>  // filepath → mtimeMs
+): Promise<string> {
+  switch (name) {
+    case "read_file":
+      result = readFile(input as { file_path: string });
+      // 记录文件的修改时间
+      if (readFileState && !result.startsWith("Error")) {
+        const absPath = resolve(input.file_path);
+        try { readFileState.set(absPath, statSync(absPath).mtimeMs); } catch {}
+      }
+      break;
+
+    case "write_file": {
+      const absPath = resolve(input.file_path);
+      // 已存在的文件必须先 read
+      if (readFileState && existsSync(absPath)) {
+        if (!readFileState.has(absPath)) {
+          return "Error: You must read this file before writing. Use read_file first.";
+        }
+        // mtime 变化说明文件被外部修改
+        const cur = statSync(absPath).mtimeMs;
+        if (cur !== readFileState.get(absPath)!) {
+          return "Warning: file was modified externally. Please read_file again.";
+        }
+      }
+      result = writeFile(input as { file_path: string; content: string });
+      // 更新 mtime
+      if (readFileState && !result.startsWith("Error")) {
+        try { readFileState.set(absPath, statSync(absPath).mtimeMs); } catch {}
+      }
+      break;
+    }
+    // edit_file 同理...
+  }
+}
+```
+<!-- tabs:end -->
+
+三个关键点：
+- **readFileState Map** 在 Agent 实例中维护，key 是绝对路径，value 是上次读取时的 `mtimeMs`
+- **新文件跳过检查**：`existsSync(absPath)` 为 false 时不强制先读——创建新文件不需要先读
+- **mtime 比较**：读取时记录 mtime，写入前比较。如果不一致，说明文件在 Agent 读取后被用户或其他进程修改了，返回警告而非静默覆盖
+
+这与 Claude Code 的 `readFileTimestamps` 机制对齐——编辑必须基于已知状态，不能"盲写"。
+
+### ToolSearch 延迟加载
+
+当工具数量增多时（66+ 工具），把所有工具的 schema 都发给 API 会浪费大量 token。Claude Code 的做法是**延迟加载**：不常用的工具只发名称，模型需要时通过 `ToolSearch` 按需激活。
+
+<!-- tabs:start -->
+#### **TypeScript**
+```typescript
+// tools.ts — deferred 标记
+{
+  name: "enter_plan_mode",
+  description: "Enter plan mode to switch to a read-only planning phase...",
+  input_schema: { type: "object", properties: {} },
+  deferred: true,  // ← 标记为延迟加载
+},
+
+// tools.ts — tool_search 工具
+{
+  name: "tool_search",
+  description: "Search for available tools by name or keyword. Returns full schemas for matching deferred tools.",
+  input_schema: {
+    type: "object",
+    properties: { query: { type: "string", description: "Tool name or search keywords" } },
+    required: ["query"],
+  },
+}
+
+// tools.ts — 激活逻辑
+const activatedTools = new Set<string>();
+
+export function getActiveToolDefinitions(allTools?: ToolDef[]): Anthropic.Tool[] {
+  const tools = allTools || toolDefinitions;
+  return tools
+    .filter(t => !t.deferred || activatedTools.has(t.name))
+    .map(({ deferred, ...rest }) => rest);
+}
+
+// tool_search 执行：匹配 → 激活 → 返回 schema
+case "tool_search": {
+  const query = (input.query as string || "").toLowerCase();
+  const deferred = toolDefinitions.filter(t => t.deferred);
+  const matches = deferred.filter(t =>
+    t.name.toLowerCase().includes(query) ||
+    (t.description || "").toLowerCase().includes(query)
+  );
+  if (matches.length === 0) return "No matching deferred tools found.";
+  for (const m of matches) activatedTools.add(m.name);
+  return JSON.stringify(matches.map(t => ({
+    name: t.name, description: t.description, input_schema: t.input_schema,
+  })), null, 2);
+}
+```
+<!-- tabs:end -->
+
+工作流程：
+1. API 调用时，`getActiveToolDefinitions()` 过滤掉未激活的 deferred 工具（只发名称，不发 schema）
+2. System prompt 中通过 `getDeferredToolNames()` 告知模型哪些工具可以通过 `tool_search` 激活
+3. 模型需要时调用 `tool_search`，匹配的工具被加入 `activatedTools` Set
+4. 下一次 API 调用自动包含已激活工具的完整 schema
+
+我们只有 2 个 deferred 工具（plan mode），但这个机制对扩展到 20+ 工具时至关重要。
+
 ## 简化对比
 
 | 维度 | Claude Code | mini-claude |
 |------|------------|-------------|
-| **工具数量** | 66+ | 10（6 核心 + skill + agent + 2 plan mode） |
-| **执行模式** | 并发执行多个工具调用 | 串行逐个执行 |
+| **工具数量** | 66+ | 13（6 核心 + web_fetch + tool_search + skill + agent + 2 plan mode） |
+| **执行模式** | 并发执行 + streaming 早期启动 | 并行执行（concurrencySafe）+ streaming 早期启动 |
 | **搜索引擎** | ripgrep（rg） | 系统 grep |
-| **编辑验证** | 14 步流水线 | 引号容错 + 唯一性 + diff 输出 |
+| **编辑验证** | 14 步流水线 + readFileTimestamps | 引号容错 + 唯一性 + diff + read-before-edit + mtime |
 | **Shell 安全** | AST 解析 + 沙箱 | 正则匹配 + 确认 |
-| **结果截断** | 选择性裁剪 | 保留头尾 50K |
+| **结果截断** | 选择性裁剪 + 磁盘持久化 | 保留头尾 50K + 30KB 磁盘持久化 |
+| **延迟加载** | deferred tools + ToolSearch | deferred 标记 + tool_search |
+| **网络访问** | WebFetch（去标签 + 超时） | web_fetch（去标签 + 30s 超时 + 50KB 上限） |
 
 ---
 

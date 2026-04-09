@@ -19,8 +19,15 @@ from .tools import (
     tool_definitions,
     execute_tool,
     check_permission,
+    CONCURRENCY_SAFE_TOOLS,
+    get_active_tool_definitions,
     ToolDef,
     PermissionMode,
+)
+from .memory import (
+    start_memory_prefetch,
+    format_memories_for_injection,
+    MemoryPrefetch,
 )
 from .ui import (
     print_assistant_text,
@@ -40,6 +47,7 @@ from .ui import (
 from .session import save_session
 from .prompt import build_system_prompt
 from .subagent import get_sub_agent_config
+from .mcp_client import McpManager
 
 # ─── Retry with exponential backoff ──────────────────────────
 
@@ -197,6 +205,17 @@ class Agent:
         # Output buffer (sub-agents capture output)
         self._output_buffer: list[str] | None = None
 
+        # Read-before-edit: track file read timestamps (absolutePath → mtime)
+        self._read_file_state: dict[str, float] = {}
+
+        # MCP integration
+        self._mcp_manager = McpManager()
+        self._mcp_initialized = False
+
+        # Memory recall state — semantic prefetch per user turn
+        self._already_surfaced_memories: set[str] = set()
+        self._session_memory_bytes = 0
+
         # Separate message histories
         self._anthropic_messages: list[dict] = []
         self._openai_messages: list[dict] = []
@@ -235,6 +254,33 @@ class Agent:
     @property
     def is_processing(self) -> bool:
         return self._current_task is not None and not self._current_task.done()
+
+    def _build_side_query(self):
+        """Build a sideQuery callable for memory recall, works with both backends."""
+        if self._anthropic_client:
+            client = self._anthropic_client
+            model = self.model
+            async def _sq(system: str, user_message: str) -> str:
+                resp = await client.messages.create(
+                    model=model, max_tokens=256, system=system,
+                    messages=[{"role": "user", "content": user_message}],
+                )
+                return "".join(b.text for b in resp.content if b.type == "text")
+            return _sq
+        if self._openai_client:
+            client = self._openai_client
+            model = self.model
+            async def _sq_oai(system: str, user_message: str) -> str:
+                resp = await client.chat.completions.create(
+                    model=model, max_tokens=256,
+                    messages=[
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": user_message},
+                    ],
+                )
+                return resp.choices[0].message.content or "" if resp.choices else ""
+            return _sq_oai
+        return None
 
     def abort(self) -> None:
         self._aborted = True
@@ -275,6 +321,17 @@ class Agent:
     # ─── Main entry point ────────────────────────────────────
 
     async def chat(self, user_message: str) -> None:
+        # Lazily connect to MCP servers on first chat (main agent only)
+        if not self._mcp_initialized and not self.is_sub_agent:
+            self._mcp_initialized = True
+            try:
+                await self._mcp_manager.load_and_connect()
+                mcp_defs = self._mcp_manager.get_tool_definitions()
+                if mcp_defs:
+                    self.tools = self.tools + mcp_defs
+            except Exception as e:
+                print(f"[mcp] Init failed: {e}", flush=True)
+
         self._aborted = False
         coro = self._chat_openai(user_message) if self.use_openai else self._chat_anthropic(user_message)
         self._current_task = asyncio.current_task()
@@ -557,6 +614,32 @@ class Agent:
                     return {"name": block["name"], "input": block.get("input", {})}
         return None
 
+    # ─── Large result persistence ─────────────────────────────────
+    # When a tool result exceeds 30 KB, write it to disk and replace the
+    # context entry with a short preview + file path.  The model can use
+    # read_file to retrieve the full output later — no information is lost.
+
+    def _persist_large_result(self, tool_name: str, result: str) -> str:
+        THRESHOLD = 30 * 1024  # 30 KB
+        if len(result.encode()) <= THRESHOLD:
+            return result
+        d = Path.home() / ".mini-claude" / "tool-results"
+        d.mkdir(parents=True, exist_ok=True)
+        filename = f"{int(time.time() * 1000)}-{tool_name}.txt"
+        filepath = d / filename
+        filepath.write_text(result, encoding="utf-8")
+
+        lines = result.split("\n")
+        preview = "\n".join(lines[:200])
+        size_kb = len(result.encode()) / 1024
+
+        return (
+            f"[Result too large ({size_kb:.1f} KB, {len(lines)} lines). "
+            f"Full output saved to {filepath}. "
+            f"You can use read_file to see the full result.]\n\n"
+            f"Preview (first 200 lines):\n{preview}"
+        )
+
     # ─── Execute tool (handles agent/skill/plan mode internally) ─────
 
     async def _execute_tool_call(self, name: str, inp: dict) -> str:
@@ -566,7 +649,10 @@ class Agent:
             return await self._execute_agent_tool(inp)
         if name == "skill":
             return await self._execute_skill_tool(inp)
-        return await execute_tool(name, inp)
+        # Route MCP tool calls to the MCP manager
+        if self._mcp_manager.is_mcp_tool(name):
+            return await self._mcp_manager.call_tool(name, inp)
+        return await execute_tool(name, inp, self._read_file_state)
 
     # ─── Skill fork mode ─────────────────────────────────────
 
@@ -751,16 +837,62 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
     async def _chat_anthropic(self, user_message: str) -> None:
         self._anthropic_messages.append({"role": "user", "content": user_message})
 
+        # Start async memory prefetch (non-blocking, fires once per user turn)
+        memory_prefetch: MemoryPrefetch | None = None
+        if not self.is_sub_agent:
+            sq = self._build_side_query()
+            if sq:
+                memory_prefetch = start_memory_prefetch(
+                    user_message, sq,
+                    self._already_surfaced_memories, self._session_memory_bytes,
+                )
+
         while True:
             if self._aborted:
                 break
 
             self._run_compression_pipeline()
 
+            # Consume memory prefetch if settled (non-blocking poll, zero-wait).
+            # Append to last user message to maintain user/assistant alternation.
+            if memory_prefetch and memory_prefetch.settled and not memory_prefetch.consumed:
+                memory_prefetch.consumed = True
+                try:
+                    memories = memory_prefetch.task.result()
+                    if memories:
+                        injection_text = format_memories_for_injection(memories)
+                        last = self._anthropic_messages[-1] if self._anthropic_messages else None
+                        if last and last.get("role") == "user":
+                            content = last.get("content", "")
+                            if isinstance(content, str):
+                                last["content"] = content + "\n\n" + injection_text
+                            elif isinstance(content, list):
+                                content.append({"type": "text", "text": injection_text})
+                        else:
+                            self._anthropic_messages.append({"role": "user", "content": injection_text})
+                        for m in memories:
+                            self._already_surfaced_memories.add(m.path)
+                            self._session_memory_bytes += len(m.content.encode())
+                except Exception:
+                    pass  # prefetch errors already logged
+
             if not self.is_sub_agent:
                 start_spinner()
 
-            response = await self._call_anthropic_stream()
+            # ── Streaming tool execution ──────────────────────────────
+            # As each tool_use content block completes during streaming, check
+            # if it's concurrency-safe and auto-allowed. If so, start execution
+            # immediately — the tool runs while the model still generates.
+            early_executions: dict[str, asyncio.Task] = {}
+
+            def _on_tool_block(block: dict):
+                if block["name"] in CONCURRENCY_SAFE_TOOLS:
+                    perm = check_permission(block["name"], block["input"], self.permission_mode, self._plan_file_path)
+                    if perm["action"] == "allow":
+                        task = asyncio.create_task(self._execute_tool_call(block["name"], block["input"]))
+                        early_executions[block["id"]] = task
+
+            response = await self._call_anthropic_stream(on_tool_block_complete=_on_tool_block)
 
             if not self.is_sub_agent:
                 stop_spinner()
@@ -788,13 +920,26 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                 print_info(f"Budget exceeded: {budget['reason']}")
                 break
 
-            tool_results = []
+            # Process tools: early-started ones (from streaming) just await
+            # their result; others go through permission check + execution.
+            tool_results: list[dict] = []
+            context_break = False
             for tu in tool_uses:
-                if self._aborted:
+                if context_break or self._aborted:
                     break
                 inp = dict(tu.input) if hasattr(tu.input, 'items') else tu.input
                 print_tool_call(tu.name, inp)
 
+                # Was this tool already started during streaming?
+                early_task = early_executions.get(tu.id)
+                if early_task:
+                    raw = await early_task
+                    res = self._persist_large_result(tu.name, raw)
+                    print_tool_result(tu.name, res)
+                    tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": res})
+                    continue
+
+                # Permission check for tools not started early
                 perm = check_permission(tu.name, inp, self.permission_mode, self._plan_file_path)
                 if perm["action"] == "deny":
                     print_info(f"Denied: {perm.get('message', '')}")
@@ -807,21 +952,22 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                         continue
                     self._confirmed_paths.add(perm["message"])
 
-                result = await self._execute_tool_call(tu.name, inp)
-                print_tool_result(tu.name, result)
+                raw = await self._execute_tool_call(tu.name, inp)
+                res = self._persist_large_result(tu.name, raw)
+                print_tool_result(tu.name, res)
 
-                # If context was cleared (plan approval with clear), inject as user message
                 if self._context_cleared:
                     self._context_cleared = False
-                    self._anthropic_messages.append({"role": "user", "content": result})
-                    tool_results = []  # Don't append tool_results
+                    self._anthropic_messages.append({"role": "user", "content": res})
+                    context_break = True
                     break
+                tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": res})
 
-                tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": result})
-
-            if tool_results:
+            if not context_break and tool_results:
                 self._anthropic_messages.append({"role": "user", "content": tool_results})
             self._context_cleared = False
+
+
             await self._check_and_compact()
 
     @staticmethod
@@ -834,14 +980,18 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
         # Fallback
         return {"type": block.type}
 
-    async def _call_anthropic_stream(self):
+    async def _call_anthropic_stream(self, on_tool_block_complete=None):
+        """Stream an Anthropic API call. When a tool_use content block finishes
+        during streaming, on_tool_block_complete fires immediately so the caller
+        can start execution before the full response arrives (streaming tool
+        execution -- mirrors Claude Code's content_block_stop approach)."""
         async def _do():
             max_output = _get_max_output_tokens(self.model)
             create_params: dict[str, Any] = {
                 "model": self.model,
                 "max_tokens": max_output if self._thinking_mode != "disabled" else 16384,
                 "system": self._system_prompt,
-                "tools": self.tools,
+                "tools": get_active_tool_definitions(self.tools),
                 "messages": self._anthropic_messages,
             }
 
@@ -849,24 +999,52 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                 create_params["thinking"] = {"type": "enabled", "budget_tokens": max_output - 1}
 
             first_text = True
+            # Track in-flight tool_use blocks by index for streaming execution
+            tool_blocks_by_index: dict[int, dict] = {}
 
             async with self._anthropic_client.messages.stream(**create_params) as stream:
                 async for event in stream:
-                    if hasattr(event, 'type'):
-                        if event.type == "content_block_delta":
-                            delta = event.delta
-                            if hasattr(delta, 'text'):
-                                if first_text:
-                                    stop_spinner()
-                                    self._emit_text("\n")
-                                    first_text = False
-                                self._emit_text(delta.text)
-                            elif hasattr(delta, 'thinking'):
-                                if first_text:
-                                    stop_spinner()
-                                    self._emit_text("\n  [thinking] ")
-                                    first_text = False
-                                self._emit_text(delta.thinking)
+                    if not hasattr(event, 'type'):
+                        continue
+
+                    if event.type == "content_block_start":
+                        cb = getattr(event, 'content_block', None)
+                        if cb and getattr(cb, 'type', None) == "tool_use":
+                            tool_blocks_by_index[event.index] = {
+                                "id": cb.id, "name": cb.name, "input_json": "",
+                            }
+
+                    elif event.type == "content_block_delta":
+                        delta = event.delta
+                        if hasattr(delta, 'text'):
+                            if first_text:
+                                stop_spinner()
+                                self._emit_text("\n")
+                                first_text = False
+                            self._emit_text(delta.text)
+                        elif hasattr(delta, 'thinking'):
+                            if first_text:
+                                stop_spinner()
+                                self._emit_text("\n  [thinking] ")
+                                first_text = False
+                            self._emit_text(delta.thinking)
+                        elif hasattr(delta, 'partial_json'):
+                            tb = tool_blocks_by_index.get(event.index)
+                            if tb:
+                                tb["input_json"] += delta.partial_json
+
+                    elif event.type == "content_block_stop":
+                        tb = tool_blocks_by_index.pop(event.index, None)
+                        if tb and on_tool_block_complete:
+                            import json as _json
+                            try:
+                                parsed = _json.loads(tb["input_json"] or "{}")
+                            except Exception:
+                                parsed = {}
+                            on_tool_block_complete({
+                                "type": "tool_use", "id": tb["id"],
+                                "name": tb["name"], "input": parsed,
+                            })
 
                 final_message = await stream.get_final_message()
 
@@ -881,11 +1059,39 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
     async def _chat_openai(self, user_message: str) -> None:
         self._openai_messages.append({"role": "user", "content": user_message})
 
+        # Start async memory prefetch (non-blocking, fires once per user turn)
+        memory_prefetch: MemoryPrefetch | None = None
+        if not self.is_sub_agent:
+            sq = self._build_side_query()
+            if sq:
+                memory_prefetch = start_memory_prefetch(
+                    user_message, sq,
+                    self._already_surfaced_memories, self._session_memory_bytes,
+                )
+
         while True:
             if self._aborted:
                 break
 
             self._run_compression_pipeline()
+
+            # Consume memory prefetch if settled (non-blocking poll, zero-wait)
+            if memory_prefetch and memory_prefetch.settled and not memory_prefetch.consumed:
+                memory_prefetch.consumed = True
+                try:
+                    memories = memory_prefetch.task.result()
+                    if memories:
+                        injection_text = format_memories_for_injection(memories)
+                        last = self._openai_messages[-1] if self._openai_messages else None
+                        if last and last.get("role") == "user":
+                            last["content"] = (last.get("content") or "") + "\n\n" + injection_text
+                        else:
+                            self._openai_messages.append({"role": "user", "content": injection_text})
+                        for m in memories:
+                            self._already_surfaced_memories.add(m.path)
+                            self._session_memory_bytes += len(m.content.encode())
+                except Exception:
+                    pass  # prefetch errors already logged
 
             if not self.is_sub_agent:
                 start_spinner()
@@ -919,6 +1125,8 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                 print_info(f"Budget exceeded: {budget['reason']}")
                 break
 
+            # Phase 1: Parse & permission-check (serial)
+            oai_checked: list[dict] = []
             for tc in tool_calls:
                 if self._aborted:
                     break
@@ -935,24 +1143,55 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                 perm = check_permission(fn_name, inp, self.permission_mode, self._plan_file_path)
                 if perm["action"] == "deny":
                     print_info(f"Denied: {perm.get('message', '')}")
-                    self._openai_messages.append({"role": "tool", "tool_call_id": tc["id"], "content": f"Action denied: {perm.get('message', '')}"})
+                    oai_checked.append({"tc": tc, "fn": fn_name, "inp": inp, "allowed": False, "result": f"Action denied: {perm.get('message', '')}"})
                     continue
                 if perm["action"] == "confirm" and perm.get("message") and perm["message"] not in self._confirmed_paths:
                     confirmed = await self._confirm_dangerous(perm["message"])
                     if not confirmed:
-                        self._openai_messages.append({"role": "tool", "tool_call_id": tc["id"], "content": "User denied this action."})
+                        oai_checked.append({"tc": tc, "fn": fn_name, "inp": inp, "allowed": False, "result": "User denied this action."})
                         continue
                     self._confirmed_paths.add(perm["message"])
+                oai_checked.append({"tc": tc, "fn": fn_name, "inp": inp, "allowed": True})
 
-                result = await self._execute_tool_call(fn_name, inp)
-                print_tool_result(fn_name, result)
+            # Phase 2: Group & execute (parallel for consecutive safe tools)
+            oai_batches: list[dict] = []
+            for ct in oai_checked:
+                safe = ct["allowed"] and ct["fn"] in CONCURRENCY_SAFE_TOOLS
+                if safe and oai_batches and oai_batches[-1]["concurrent"]:
+                    oai_batches[-1]["items"].append(ct)
+                else:
+                    oai_batches.append({"concurrent": safe, "items": [ct]})
 
-                if self._context_cleared:
-                    self._context_cleared = False
-                    self._openai_messages.append({"role": "user", "content": result})
+            oai_context_break = False
+            for batch in oai_batches:
+                if oai_context_break or self._aborted:
                     break
 
-                self._openai_messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
+                if batch["concurrent"]:
+                    async def _run_oai_safe(ct_item: dict) -> tuple[dict, str]:
+                        raw = await self._execute_tool_call(ct_item["fn"], ct_item["inp"])
+                        res = self._persist_large_result(ct_item["fn"], raw)
+                        print_tool_result(ct_item["fn"], res)
+                        return ct_item, res
+
+                    results = await asyncio.gather(*[_run_oai_safe(ct) for ct in batch["items"]])
+                    for ct_item, res in results:
+                        self._openai_messages.append({"role": "tool", "tool_call_id": ct_item["tc"]["id"], "content": res})
+                else:
+                    for ct in batch["items"]:
+                        if not ct["allowed"]:
+                            self._openai_messages.append({"role": "tool", "tool_call_id": ct["tc"]["id"], "content": ct["result"]})
+                            continue
+                        raw = await self._execute_tool_call(ct["fn"], ct["inp"])
+                        res = self._persist_large_result(ct["fn"], raw)
+                        print_tool_result(ct["fn"], res)
+
+                        if self._context_cleared:
+                            self._context_cleared = False
+                            self._openai_messages.append({"role": "user", "content": res})
+                            oai_context_break = True
+                            break
+                        self._openai_messages.append({"role": "tool", "tool_call_id": ct["tc"]["id"], "content": res})
 
             self._context_cleared = False
             await self._check_and_compact()
@@ -962,7 +1201,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             stream = await self._openai_client.chat.completions.create(
                 model=self.model,
                 max_tokens=16384,
-                tools=_to_openai_tools(self.tools),
+                tools=_to_openai_tools(get_active_tool_definitions(self.tools)),
                 messages=self._openai_messages,
                 stream=True,
                 stream_options={"include_usage": True},

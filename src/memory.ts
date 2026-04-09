@@ -1,5 +1,5 @@
 // Memory system — 4-type file-based memory with MEMORY.md index.
-// Mirrors Claude Code's memory architecture (user/feedback/project/reference).
+// Mirrors Claude Code's memory architecture: semantic recall via sideQuery.
 
 import {
   readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync,
@@ -9,6 +9,9 @@ import { join } from "path";
 import { homedir } from "os";
 import { createHash } from "crypto";
 import { parseFrontmatter, formatFrontmatter } from "./frontmatter.js";
+
+/** A function that sends a prompt and returns the model's text response. */
+export type SideQueryFn = (system: string, userMessage: string, signal?: AbortSignal) => Promise<string>;
 
 // ─── Types ──────────────────────────────────────────────────
 
@@ -133,31 +136,199 @@ export function loadMemoryIndex(): string {
   return content;
 }
 
-// ─── Recall (keyword matching) ──────────────────────────────
+// ─── Memory Header (lightweight scan) ──────────────────────
 
-export function recallMemories(query: string, limit = 5): MemoryEntry[] {
-  const memories = listMemories();
-  if (memories.length === 0) return [];
+export interface MemoryHeader {
+  filename: string;
+  filePath: string;
+  mtimeMs: number;
+  description: string | null;
+  type: MemoryType | undefined;
+}
 
-  // Tokenize query into words
-  const queryWords = query.toLowerCase().split(/\s+/).filter((w) => w.length > 2);
-  if (queryWords.length === 0) return memories.slice(0, limit);
+const MAX_MEMORY_FILES = 200;
+const MAX_MEMORY_BYTES_PER_FILE = 4096;
+const MAX_SESSION_MEMORY_BYTES = 60 * 1024; // 60KB cumulative per session
 
-  // Score each memory by keyword overlap
-  const scored = memories.map((m) => {
-    const text = `${m.name} ${m.description} ${m.type} ${m.content}`.toLowerCase();
-    let score = 0;
-    for (const word of queryWords) {
-      if (text.includes(word)) score++;
-    }
-    return { memory: m, score };
-  });
+/** Scan memory directory — read only frontmatter (first 30 lines) for speed. */
+export function scanMemoryHeaders(): MemoryHeader[] {
+  const dir = getMemoryDir();
+  const files = readdirSync(dir).filter(
+    (f) => f.endsWith(".md") && f !== "MEMORY.md"
+  );
+  const headers: MemoryHeader[] = [];
+  for (const file of files) {
+    try {
+      const filePath = join(dir, file);
+      const stat = statSync(filePath);
+      const raw = readFileSync(filePath, "utf-8");
+      // Only parse frontmatter (first 30 lines)
+      const first30 = raw.split("\n").slice(0, 30).join("\n");
+      const { meta } = parseFrontmatter(first30);
+      headers.push({
+        filename: file,
+        filePath,
+        mtimeMs: stat.mtimeMs,
+        description: meta.description || null,
+        type: VALID_TYPES.has(meta.type as MemoryType) ? (meta.type as MemoryType) : undefined,
+      });
+    } catch { /* skip corrupt files */ }
+  }
+  // Sort newest first, cap at 200
+  headers.sort((a, b) => b.mtimeMs - a.mtimeMs);
+  return headers.slice(0, MAX_MEMORY_FILES);
+}
 
-  return scored
-    .filter((s) => s.score > 0)
-    .sort((a, b) => b.score - a.score)
-    .slice(0, limit)
-    .map((s) => s.memory);
+/** Format manifest for semantic selector: one line per memory. */
+export function formatMemoryManifest(headers: MemoryHeader[]): string {
+  return headers
+    .map((h) => {
+      const tag = h.type ? `[${h.type}] ` : "";
+      const ts = new Date(h.mtimeMs).toISOString();
+      return h.description
+        ? `- ${tag}${h.filename} (${ts}): ${h.description}`
+        : `- ${tag}${h.filename} (${ts})`;
+    })
+    .join("\n");
+}
+
+// ─── Memory Age / Freshness ────────────────────────────────
+
+export function memoryAge(mtimeMs: number): string {
+  const days = Math.max(0, Math.floor((Date.now() - mtimeMs) / 86_400_000));
+  if (days === 0) return "today";
+  if (days === 1) return "yesterday";
+  return `${days} days ago`;
+}
+
+export function memoryFreshnessWarning(mtimeMs: number): string {
+  const days = Math.max(0, Math.floor((Date.now() - mtimeMs) / 86_400_000));
+  if (days <= 1) return "";
+  return `This memory is ${days} days old. Memories are point-in-time observations, not live state — claims about code behavior may be outdated. Verify against current code before asserting as fact.`;
+}
+
+// ─── Semantic Recall (sideQuery) ────────────────────────────
+
+const SELECT_MEMORIES_PROMPT = `You are selecting memories that will be useful to an AI coding assistant as it processes a user's query. You will be given the user's query and a list of available memory files with their filenames and descriptions.
+
+Return a JSON object with a "selected_memories" array of filenames for the memories that will clearly be useful (up to 5). Only include memories that you are certain will be helpful based on their name and description.
+- If you are unsure if a memory will be useful, do not include it.
+- If no memories would clearly be useful, return an empty array.`;
+
+export interface RelevantMemory {
+  path: string;
+  content: string;
+  mtimeMs: number;
+  header: string;
+}
+
+/**
+ * Call the model to semantically select relevant memories.
+ * Uses the same model the user configured (not a separate small model).
+ */
+export async function selectRelevantMemories(
+  query: string,
+  sideQuery: SideQueryFn,
+  alreadySurfaced: Set<string>,
+  signal?: AbortSignal,
+): Promise<RelevantMemory[]> {
+  const headers = scanMemoryHeaders();
+  if (headers.length === 0) return [];
+
+  // Filter out already-surfaced memories before sending to selector
+  const candidates = headers.filter((h) => !alreadySurfaced.has(h.filePath));
+  if (candidates.length === 0) return [];
+
+  const manifest = formatMemoryManifest(candidates);
+
+  try {
+    const text = await sideQuery(
+      SELECT_MEMORIES_PROMPT,
+      `Query: ${query}\n\nAvailable memories:\n${manifest}`,
+      signal,
+    );
+
+    // Extract JSON from response (model might wrap in markdown code block)
+    const jsonMatch = text.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) return [];
+
+    const parsed = JSON.parse(jsonMatch[0]);
+    const selectedFilenames: string[] = parsed.selected_memories || [];
+
+    // Map filenames back to headers, read full content
+    const filenameSet = new Set(selectedFilenames);
+    const selected = candidates.filter((h) => filenameSet.has(h.filename));
+
+    return selected.slice(0, 5).map((h) => {
+      let content = readFileSync(h.filePath, "utf-8");
+      // Truncate to per-file limit
+      if (Buffer.byteLength(content) > MAX_MEMORY_BYTES_PER_FILE) {
+        content = content.slice(0, MAX_MEMORY_BYTES_PER_FILE) +
+          "\n\n[... truncated, memory file too large ...]";
+      }
+      const freshness = memoryFreshnessWarning(h.mtimeMs);
+      const headerText = freshness
+        ? `${freshness}\n\nMemory: ${h.filePath}:`
+        : `Memory (saved ${memoryAge(h.mtimeMs)}): ${h.filePath}:`;
+
+      return { path: h.filePath, content, mtimeMs: h.mtimeMs, header: headerText };
+    });
+  } catch (err: any) {
+    // Silently fail — memory recall should never block the main loop
+    if (signal?.aborted) return [];
+    console.error(`[memory] semantic recall failed: ${err.message}`);
+    return [];
+  }
+}
+
+// ─── Prefetch Handle ────────────────────────────────────────
+
+export interface MemoryPrefetch {
+  promise: Promise<RelevantMemory[]>;
+  settled: boolean;
+  consumed: boolean;
+}
+
+/**
+ * Start async memory prefetch. Returns a handle to poll for results.
+ * Gate conditions (matching Claude Code):
+ *   - Input must have multiple words
+ *   - Session memory budget not exceeded
+ */
+export function startMemoryPrefetch(
+  query: string,
+  sideQuery: SideQueryFn,
+  alreadySurfaced: Set<string>,
+  sessionMemoryBytes: number,
+  signal?: AbortSignal,
+): MemoryPrefetch | null {
+  // Gate: multi-word input only
+  if (!/\s/.test(query.trim())) return null;
+
+  // Gate: session budget
+  if (sessionMemoryBytes >= MAX_SESSION_MEMORY_BYTES) return null;
+
+  // Gate: memories must exist
+  const dir = getMemoryDir();
+  const hasMemories = readdirSync(dir).some(
+    (f) => f.endsWith(".md") && f !== "MEMORY.md"
+  );
+  if (!hasMemories) return null;
+
+  const handle: MemoryPrefetch = {
+    promise: selectRelevantMemories(query, sideQuery, alreadySurfaced, signal),
+    settled: false,
+    consumed: false,
+  };
+  handle.promise.then(() => { handle.settled = true; }).catch(() => { handle.settled = true; });
+  return handle;
+}
+
+/** Format recalled memories for injection as user message content. */
+export function formatMemoriesForInjection(memories: RelevantMemory[]): string {
+  return memories
+    .map((m) => `<system-reminder>\n${m.header}\n\n${m.content}\n</system-reminder>`)
+    .join("\n\n");
 }
 
 // ─── System prompt section ──────────────────────────────────

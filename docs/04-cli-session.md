@@ -1,4 +1,4 @@
-# 7. CLI、REPL 与会话
+# 4. CLI 与会话
 
 ## 本章目标
 
@@ -454,3 +454,5 @@ def print_tool_result(name: str, result: str) -> None:
 <!-- tabs:end -->
 
 工具结果在 UI 层截断到 500 字符——这是给人看的显示，完整结果已在消息历史中。
+
+> **下一章**：让 Agent 的输出实时显示——流式输出与双后端支持。

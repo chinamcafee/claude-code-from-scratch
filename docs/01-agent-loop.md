@@ -120,7 +120,7 @@ private async chatAnthropic(userMessage: string): Promise<void> {
       const input = toolUse.input as Record<string, any>;
       printToolCall(toolUse.name, input);
 
-      // 权限检查（详见第 5 章）
+      // 权限检查（详见第 6 章）
       const perm = checkPermission(toolUse.name, input, this.permissionMode, this.planFilePath);
       if (perm.action === "deny") {
         toolResults.push({ type: "tool_result", tool_use_id: toolUse.id,
@@ -145,7 +145,7 @@ private async chatAnthropic(userMessage: string): Promise<void> {
     // 工具结果以 user 消息推入（Anthropic API 要求）
     this.anthropicMessages.push({ role: "user", content: toolResults });
 
-    // 上下文压缩检查（详见第 6 章）
+    // 上下文压缩检查（详见第 7 章）
     await this.checkAndCompact();
   }
 }
@@ -187,7 +187,7 @@ async def _chat_anthropic(self, user_message: str) -> None:
             inp = dict(tu.input) if hasattr(tu.input, 'items') else tu.input
             print_tool_call(tu.name, inp)
 
-            # 权限检查（详见第 5 章）
+            # 权限检查（详见第 6 章）
             perm = check_permission(tu.name, inp, self.permission_mode, self._plan_file_path)
             if perm["action"] == "deny":
                 tool_results.append({"type": "tool_result", "tool_use_id": tu.id,

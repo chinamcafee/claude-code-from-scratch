@@ -160,6 +160,7 @@ import * as os from "os";
 import { buildMemoryPromptSection } from "./memory.js";
 import { buildSkillDescriptions } from "./skills.js";
 import { buildAgentDescriptions } from "./subagent.js";
+import { getDeferredToolNames } from "./tools.js";
 
 export function loadClaudeMd(): string {
   const parts: string[] = [];
@@ -167,15 +168,21 @@ export function loadClaudeMd(): string {
   while (true) {
     const file = join(dir, "CLAUDE.md");
     if (existsSync(file)) {
-      try { parts.unshift(readFileSync(file, "utf-8")); } catch {}
+      try {
+        let content = readFileSync(file, "utf-8");
+        content = resolveIncludes(content, dir);  // @include 解析
+        parts.unshift(content);
+      } catch {}
     }
     const parent = resolve(dir, "..");
     if (parent === dir) break;
     dir = parent;
   }
-  return parts.length > 0
+  const rules = loadRulesDir(process.cwd());  // .claude/rules/*.md
+  const claudeMd = parts.length > 0
     ? "\n\n# Project Instructions (CLAUDE.md)\n" + parts.join("\n\n---\n\n")
     : "";
+  return claudeMd + rules;
 }
 
 export function getGitContext(): string {
@@ -227,16 +234,18 @@ def load_claude_md() -> str:
         f = d / "CLAUDE.md"
         if f.is_file():
             try:
-                parts.insert(0, f.read_text())
+                content = f.read_text()
+                content = resolve_includes(content, str(d))  # @include 解析
+                parts.insert(0, content)
             except Exception:
                 pass
         parent = d.parent
         if parent == d:
             break
         d = parent
-    if parts:
-        return "\n\n# Project Instructions (CLAUDE.md)\n" + "\n\n---\n\n".join(parts)
-    return ""
+    rules = load_rules_dir(str(Path.cwd()))  # .claude/rules/*.md
+    claude_md = "\n\n# Project Instructions (CLAUDE.md)\n" + "\n\n---\n\n".join(parts) if parts else ""
+    return claude_md + rules
 
 
 def get_git_context() -> str:
@@ -284,12 +293,125 @@ def build_system_prompt() -> str:
 | Claude Code | mini-claude | 理由 |
 |------------|-------------|------|
 | Static/Dynamic 缓存边界 | 不实现 | 教程项目无需优化 API 成本 |
-| CLAUDE.md 5 层发现 + .claude 子目录 | 只从 CWD 向上遍历 | 覆盖最常见场景 |
-| @include 指令 | 不实现 | 增加复杂度，收益低 |
+| CLAUDE.md 5 层发现 + .claude 子目录 | 从 CWD 向上遍历 + .claude/rules/ | 覆盖常见场景 |
+| @include 指令 | 支持 @./path、@~/path、@/path | 完整实现 |
 | 反模式接种（3 条规则） | 完整保留 | 对输出质量影响极大 |
 | 爆炸半径框架 | 完整保留 | 安全性不能简化 |
 | 工具偏好映射表 | 适配工具名保留 | 必须有，否则模型默认用 bash |
+| Deferred 工具名注入 | getDeferredToolNames() | 告知模型哪些工具可按需激活 |
+
+### @include 语法与 Rules 自动加载
+
+CLAUDE.md 文件支持 `@` 语法引用外部文件，实现项目配置的模块化。同时，`.claude/rules/*.md` 目录下的规则文件会自动加载。
+
+<!-- tabs:start -->
+#### **TypeScript**
+```typescript
+// prompt.ts — @include 解析
+
+const INCLUDE_REGEX = /^@(\.\/[^\s]+|~\/[^\s]+|\/[^\s]+)$/gm;
+const MAX_INCLUDE_DEPTH = 5;
+
+function resolveIncludes(
+  content: string,
+  basePath: string,
+  visited: Set<string> = new Set(),
+  depth: number = 0
+): string {
+  if (depth >= MAX_INCLUDE_DEPTH) return content;
+  return content.replace(INCLUDE_REGEX, (_match, rawPath: string) => {
+    let resolved: string;
+    if (rawPath.startsWith("~/")) {
+      resolved = join(os.homedir(), rawPath.slice(2));
+    } else if (rawPath.startsWith("/")) {
+      resolved = rawPath;
+    } else {
+      resolved = resolve(basePath, rawPath);  // ./relative
+    }
+    resolved = resolve(resolved);
+    if (visited.has(resolved)) return `<!-- circular: ${rawPath} -->`;
+    if (!existsSync(resolved)) return `<!-- not found: ${rawPath} -->`;
+    try {
+      visited.add(resolved);
+      const included = readFileSync(resolved, "utf-8");
+      return resolveIncludes(included, dirname(resolved), visited, depth + 1);
+    } catch {
+      return `<!-- error reading: ${rawPath} -->`;
+    }
+  });
+}
+```
+<!-- tabs:end -->
+
+三种路径格式：
+- `@./relative/path` — 相对于当前 CLAUDE.md 所在目录
+- `@~/path` — 相对于用户 home 目录
+- `@/absolute/path` — 绝对路径
+
+防护措施：
+- **visited Set** 防止循环引用（A include B，B include A）
+- **MAX_INCLUDE_DEPTH = 5** 防止嵌套过深
+- 找不到文件时留下 HTML 注释标记，不报错中断
+
+`.claude/rules/*.md` 自动加载：
+
+<!-- tabs:start -->
+#### **TypeScript**
+```typescript
+// prompt.ts — 规则目录加载
+
+function loadRulesDir(dir: string): string {
+  const rulesDir = join(dir, ".claude", "rules");
+  if (!existsSync(rulesDir)) return "";
+  const files = readdirSync(rulesDir).filter(f => f.endsWith(".md")).sort();
+  const parts: string[] = [];
+  for (const file of files) {
+    let content = readFileSync(join(rulesDir, file), "utf-8");
+    content = resolveIncludes(content, rulesDir);  // 规则文件也支持 @include
+    parts.push(`<!-- rule: ${file} -->\n${content}`);
+  }
+  return parts.length > 0 ? "\n\n## Rules\n" + parts.join("\n\n") : "";
+}
+```
+<!-- tabs:end -->
+
+使用示例：
+
+```markdown
+# CLAUDE.md
+@./.claude/rules/chinese-greeting.md
+@./docs/coding-style.md
+
+This project uses TypeScript with strict mode.
+```
+
+加载后，引用会被替换为文件内容。这让团队可以把共享规则放在 `.claude/rules/` 目录下，CLAUDE.md 只需一行引用。
+
+loadClaudeMd 整合了三者：向上遍历 CLAUDE.md + @include 解析 + rules 目录：
+
+```typescript
+export function loadClaudeMd(): string {
+  const parts: string[] = [];
+  let dir = process.cwd();
+  while (true) {
+    const file = join(dir, "CLAUDE.md");
+    if (existsSync(file)) {
+      let content = readFileSync(file, "utf-8");
+      content = resolveIncludes(content, dir);  // 每个 CLAUDE.md 都解析 @include
+      parts.unshift(content);
+    }
+    const parent = resolve(dir, "..");
+    if (parent === dir) break;
+    dir = parent;
+  }
+  const rules = loadRulesDir(process.cwd());
+  const claudeMd = parts.length > 0
+    ? "\n\n# Project Instructions (CLAUDE.md)\n" + parts.join("\n\n---\n\n")
+    : "";
+  return claudeMd + rules;
+}
+```
 
 ---
 
-> **下一章**：Prompt 和工具定义了 agent 的"灵魂"，但用户体验的关键在于**流式输出**——让 LLM 的回答逐字显示，而不是等几十秒后一次性输出。
+> **下一章**：有了工具和提示词，下一步是让 Agent 变得可交互——CLI 入口、REPL 循环和会话持久化。

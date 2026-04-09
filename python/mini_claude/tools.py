@@ -19,8 +19,11 @@ from .frontmatter import parse_frontmatter
 
 PermissionMode = str  # "default" | "plan" | "acceptEdits" | "bypassPermissions" | "dontAsk"
 
-READ_TOOLS = {"read_file", "list_files", "grep_search"}
+READ_TOOLS = {"read_file", "list_files", "grep_search", "web_fetch"}
 EDIT_TOOLS = {"write_file", "edit_file"}
+
+# Concurrency-safe tools can run in parallel (read-only, no side effects)
+CONCURRENCY_SAFE_TOOLS = {"read_file", "list_files", "grep_search", "web_fetch"}
 
 IS_WIN = sys.platform == "win32"
 
@@ -117,14 +120,28 @@ tool_definitions: list[ToolDef] = [
         },
     },
     {
+        "name": "web_fetch",
+        "description": "Fetch a URL and return its content as text. For HTML pages, tags are stripped to return readable text. For JSON/text responses, content is returned directly.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "The URL to fetch"},
+                "max_length": {"type": "number", "description": "Maximum content length in characters (default 50000)"},
+            },
+            "required": ["url"],
+        },
+    },
+    {
         "name": "enter_plan_mode",
         "description": "Enter plan mode to switch to a read-only planning phase. In plan mode, you can only read files and write to the plan file.",
         "input_schema": {"type": "object", "properties": {}},
+        "deferred": True,
     },
     {
         "name": "exit_plan_mode",
         "description": "Exit plan mode after you have finished writing your plan to the plan file.",
         "input_schema": {"type": "object", "properties": {}},
+        "deferred": True,
     },
     {
         "name": "agent",
@@ -139,7 +156,45 @@ tool_definitions: list[ToolDef] = [
             "required": ["description", "prompt"],
         },
     },
+    # ─── Tool search (deferred tool loader) ─────────────────────
+    {
+        "name": "tool_search",
+        "description": "Search for available tools by name or keyword. Returns full schema definitions for matching deferred tools so you can use them.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Tool name or search keywords"},
+            },
+            "required": ["query"],
+        },
+    },
 ]
+
+# ─── Deferred tool activation ───────────────────────────────
+
+_activated_tools: set[str] = set()
+
+
+def reset_activated_tools() -> None:
+    _activated_tools.clear()
+
+
+def get_active_tool_definitions(all_tools: list[ToolDef] | None = None) -> list[ToolDef]:
+    """Return tool definitions, excluding deferred tools that haven't been activated.
+    Strips the 'deferred' key so it's not sent to the API."""
+    tools = all_tools if all_tools is not None else tool_definitions
+    return [
+        {k: v for k, v in t.items() if k != "deferred"}
+        for t in tools
+        if not t.get("deferred") or t["name"] in _activated_tools
+    ]
+
+
+def get_deferred_tool_names(all_tools: list[ToolDef] | None = None) -> list[str]:
+    """Return names of deferred tools that haven't been activated yet."""
+    tools = all_tools if all_tools is not None else tool_definitions
+    return [t["name"] for t in tools if t.get("deferred") and t["name"] not in _activated_tools]
+
 
 # ─── Tool execution ─────────────────────────────────────────
 
@@ -370,6 +425,40 @@ def _run_shell(inp: dict) -> str:
         return f"Error: {e}"
 
 
+def _web_fetch(inp: dict) -> str:
+    import urllib.request
+    import urllib.error
+
+    url = inp.get("url", "")
+    max_length = inp.get("max_length", 50000)
+    req = urllib.request.Request(url, headers={"User-Agent": "mini-claude/1.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            content_type = resp.headers.get("Content-Type", "")
+            text = resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as e:
+        return f"HTTP error: {e.code} {e.reason}"
+    except urllib.error.URLError as e:
+        return f"Error fetching {url}: {e.reason}"
+    except Exception as e:
+        return f"Error fetching {url}: {e}"
+
+    if "html" in content_type:
+        text = re.sub(r"<script[\s\S]*?</script>", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"<style[\s\S]*?</style>", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"<[^>]*>", " ", text)
+        text = text.replace("&nbsp;", " ").replace("&amp;", "&")
+        text = text.replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", '"')
+        text = re.sub(r"\s{2,}", " ", text)
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        text = text.strip()
+
+    if len(text) > max_length:
+        text = text[:max_length] + f"\n\n[... truncated at {max_length} characters]"
+
+    return text or "(empty response)"
+
+
 # ─── Dangerous command patterns ─────────────────────────────
 
 DANGEROUS_PATTERNS = [
@@ -548,19 +637,69 @@ def _truncate_result(result: str) -> str:
 # "agent" and "skill" tools are handled in agent.py to avoid circular deps.
 
 
-async def execute_tool(name: str, inp: dict) -> str:
-    handlers = {
-        "read_file": _read_file,
+async def execute_tool(
+    name: str, inp: dict, read_file_state: dict[str, float] | None = None
+) -> str:
+    # ─── read-before-edit + mtime freshness checks ───────────
+    if name == "read_file":
+        result = _read_file(inp)
+        if read_file_state is not None and not result.startswith("Error"):
+            abs_path = str(Path(inp["file_path"]).resolve())
+            try:
+                read_file_state[abs_path] = os.path.getmtime(abs_path)
+            except OSError:
+                pass
+        return _truncate_result(result)
+
+    if name in ("write_file", "edit_file") and read_file_state is not None:
+        abs_path = str(Path(inp["file_path"]).resolve())
+        if os.path.exists(abs_path):
+            if abs_path not in read_file_state:
+                verb = "writing" if name == "write_file" else "editing"
+                return f"Error: You must read this file before {verb}. Use read_file first to see its current contents."
+            if os.path.getmtime(abs_path) != read_file_state[abs_path]:
+                verb = "writing" if name == "write_file" else "editing"
+                return f"Warning: {inp['file_path']} was modified externally since your last read. Please read_file again before {verb}."
+
+    # tool_search: activate deferred tools and return their schemas
+    if name == "tool_search":
+        query = (inp.get("query") or "").lower()
+        deferred = [t for t in tool_definitions if t.get("deferred")]
+        matches = [
+            t for t in deferred
+            if query in t["name"].lower() or query in (t.get("description") or "").lower()
+        ]
+        if not matches:
+            return "No matching deferred tools found."
+        for m in matches:
+            _activated_tools.add(m["name"])
+        return json.dumps(
+            [{"name": t["name"], "description": t.get("description", ""), "input_schema": t["input_schema"]} for t in matches],
+            indent=2,
+        )
+
+    handlers: dict = {
         "write_file": _write_file,
         "edit_file": _edit_file,
         "list_files": _list_files,
         "grep_search": _grep_search,
         "run_shell": _run_shell,
+        "web_fetch": _web_fetch,
     }
     handler = handlers.get(name)
     if not handler:
         return f"Unknown tool: {name}"
-    return _truncate_result(handler(inp))
+    result = _truncate_result(handler(inp))
+
+    # Update mtime after successful write/edit
+    if name in ("write_file", "edit_file") and read_file_state is not None and not result.startswith("Error"):
+        abs_path = str(Path(inp["file_path"]).resolve())
+        try:
+            read_file_state[abs_path] = os.path.getmtime(abs_path)
+        except OSError:
+            pass
+
+    return result
 
 
 def reset_permission_cache() -> None:

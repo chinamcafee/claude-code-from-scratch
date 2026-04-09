@@ -1,10 +1,74 @@
-import { readFileSync, existsSync } from "fs";
-import { join, resolve } from "path";
+import { readFileSync, existsSync, readdirSync } from "fs";
+import { join, resolve, dirname } from "path";
 import { execSync } from "child_process";
 import * as os from "os";
 import { buildMemoryPromptSection } from "./memory.js";
 import { buildSkillDescriptions } from "./skills.js";
 import { buildAgentDescriptions } from "./subagent.js";
+import { getDeferredToolNames } from "./tools.js";
+
+// ─── @include resolution ─────────────────────────────────────
+// Resolves @./path, @~/path, @/path references in CLAUDE.md files.
+// Mirrors Claude Code's include directive: recursively replaces @-references
+// with file contents, preventing circular includes via a visited set.
+
+const INCLUDE_REGEX = /^@(\.\/[^\s]+|~\/[^\s]+|\/[^\s]+)$/gm;
+const MAX_INCLUDE_DEPTH = 5;
+
+function resolveIncludes(
+  content: string,
+  basePath: string,
+  visited: Set<string> = new Set(),
+  depth: number = 0
+): string {
+  if (depth >= MAX_INCLUDE_DEPTH) return content;
+  return content.replace(INCLUDE_REGEX, (_match, rawPath: string) => {
+    // Resolve the path
+    let resolved: string;
+    if (rawPath.startsWith("~/")) {
+      resolved = join(os.homedir(), rawPath.slice(2));
+    } else if (rawPath.startsWith("/")) {
+      resolved = rawPath;
+    } else {
+      // ./relative
+      resolved = resolve(basePath, rawPath);
+    }
+    resolved = resolve(resolved); // normalize
+    if (visited.has(resolved)) return `<!-- circular: ${rawPath} -->`;
+    if (!existsSync(resolved)) return `<!-- not found: ${rawPath} -->`;
+    try {
+      visited.add(resolved);
+      const included = readFileSync(resolved, "utf-8");
+      return resolveIncludes(included, dirname(resolved), visited, depth + 1);
+    } catch {
+      return `<!-- error reading: ${rawPath} -->`;
+    }
+  });
+}
+
+// ─── .claude/rules/*.md auto-loader ─────────────────────────
+
+function loadRulesDir(dir: string): string {
+  const rulesDir = join(dir, ".claude", "rules");
+  if (!existsSync(rulesDir)) return "";
+  try {
+    const files = readdirSync(rulesDir)
+      .filter((f) => f.endsWith(".md"))
+      .sort();
+    if (files.length === 0) return "";
+    const parts: string[] = [];
+    for (const file of files) {
+      try {
+        let content = readFileSync(join(rulesDir, file), "utf-8");
+        content = resolveIncludes(content, rulesDir);
+        parts.push(`<!-- rule: ${file} -->\n${content}`);
+      } catch {}
+    }
+    return parts.length > 0 ? "\n\n## Rules\n" + parts.join("\n\n") : "";
+  } catch {
+    return "";
+  }
+}
 
 // ─── CLAUDE.md loader ────────────────────────────────────────
 
@@ -15,16 +79,21 @@ export function loadClaudeMd(): string {
     const file = join(dir, "CLAUDE.md");
     if (existsSync(file)) {
       try {
-        parts.unshift(readFileSync(file, "utf-8"));
+        let content = readFileSync(file, "utf-8");
+        content = resolveIncludes(content, dir);
+        parts.unshift(content);
       } catch {}
     }
     const parent = resolve(dir, "..");
     if (parent === dir) break;
     dir = parent;
   }
-  return parts.length > 0
+  // Load .claude/rules/*.md from cwd
+  const rules = loadRulesDir(process.cwd());
+  const claudeMd = parts.length > 0
     ? "\n\n# Project Instructions (CLAUDE.md)\n" + parts.join("\n\n---\n\n")
     : "";
+  return claudeMd + rules;
 }
 
 // ─── Git context ─────────────────────────────────────────────
@@ -125,7 +194,8 @@ Shell: {{shell}}
 {{claude_md}}
 {{memory}}
 {{skills}}
-{{agents}}`;
+{{agents}}
+{{deferred_tools}}`;
 
 // ─── System prompt builder ───────────────────────────────────
 
@@ -141,6 +211,11 @@ export function buildSystemPrompt(): string {
   const skillsSection = buildSkillDescriptions();
   const agentSection = buildAgentDescriptions();
 
+  const deferredNames = getDeferredToolNames();
+  const deferredSection = deferredNames.length > 0
+    ? `\n\nThe following deferred tools are available via tool_search: ${deferredNames.join(", ")}. Use tool_search to fetch their full schemas when needed.`
+    : "";
+
   return SYSTEM_PROMPT_TEMPLATE
     .split("{{cwd}}").join(process.cwd())
     .split("{{date}}").join(date)
@@ -150,5 +225,6 @@ export function buildSystemPrompt(): string {
     .split("{{claude_md}}").join(claudeMd)
     .split("{{memory}}").join(memorySection)
     .split("{{skills}}").join(skillsSection)
-    .split("{{agents}}").join(agentSection);
+    .split("{{agents}}").join(agentSection)
+    .split("{{deferred_tools}}").join(deferredSection);
 }

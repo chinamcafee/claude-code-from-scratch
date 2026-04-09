@@ -1,7 +1,7 @@
 import Anthropic from "@anthropic-ai/sdk";
 import OpenAI from "openai";
 import chalk from "chalk";
-import { toolDefinitions, executeTool, checkPermission, type ToolDef, type PermissionMode } from "./tools.js";
+import { toolDefinitions, executeTool, checkPermission, CONCURRENCY_SAFE_TOOLS, getActiveToolDefinitions, getDeferredToolNames, type ToolDef, type PermissionMode } from "./tools.js";
 import {
   printAssistantText,
   printToolCall,
@@ -20,9 +20,14 @@ import {
 import { saveSession } from "./session.js";
 import { buildSystemPrompt } from "./prompt.js";
 import { getSubAgentConfig, type SubAgentType } from "./subagent.js";
+import {
+  startMemoryPrefetch, formatMemoriesForInjection,
+  type MemoryPrefetch, type RelevantMemory, type SideQueryFn,
+} from "./memory.js";
+import { McpManager } from "./mcp.js";
 import * as readline from "readline";
 import { randomUUID } from "crypto";
-import { existsSync, readFileSync, mkdirSync } from "fs";
+import { existsSync, readFileSync, mkdirSync, writeFileSync } from "fs";
 import { join } from "path";
 import { homedir } from "os";
 
@@ -155,6 +160,10 @@ export class Agent {
   private sessionStartTime: string;
   private isSubAgent: boolean;
 
+  // MCP integration
+  private mcpManager = new McpManager();
+  private mcpInitialized = false;
+
   // Budget control
   private maxCostUsd?: number;
   private maxTurns?: number;
@@ -186,6 +195,13 @@ export class Agent {
 
   // Sub-agent output buffer (captures text instead of printing)
   private outputBuffer: string[] | null = null;
+
+  // Read-before-edit: track file read timestamps (absolutePath → mtimeMs)
+  private readFileState: Map<string, number> = new Map();
+
+  // Memory recall state — semantic prefetch per user turn
+  private alreadySurfacedMemories: Set<string> = new Set();
+  private sessionMemoryBytes = 0;
 
   // Separate message histories for each backend
   private anthropicMessages: Anthropic.MessageParam[] = [];
@@ -236,6 +252,38 @@ export class Agent {
     if (!modelSupportsThinking(this.model)) return "disabled";
     if (modelSupportsAdaptiveThinking(this.model)) return "adaptive";
     return "enabled";
+  }
+
+  /** Build a sideQuery function for memory recall, works with both backends. */
+  private buildSideQuery(): SideQueryFn | null {
+    if (this.anthropicClient) {
+      const client = this.anthropicClient;
+      const model = this.model;
+      return async (system, userMessage, signal) => {
+        const resp = await client.messages.create({
+          model, max_tokens: 256, system,
+          messages: [{ role: "user", content: userMessage }],
+        }, { signal });
+        return resp.content
+          .filter((b): b is Anthropic.TextBlock => b.type === "text")
+          .map((b) => b.text).join("");
+      };
+    }
+    if (this.openaiClient) {
+      const client = this.openaiClient;
+      const model = this.model;
+      return async (system, userMessage, _signal) => {
+        const resp = await client.chat.completions.create({
+          model, max_tokens: 256,
+          messages: [
+            { role: "system", content: system },
+            { role: "user", content: userMessage },
+          ],
+        });
+        return resp.choices?.[0]?.message?.content || "";
+      };
+    }
+    return null;
   }
 
   abort() {
@@ -293,6 +341,19 @@ export class Agent {
   }
 
   async chat(userMessage: string): Promise<void> {
+    // Lazily connect to MCP servers on first chat (main agent only)
+    if (!this.mcpInitialized && !this.isSubAgent) {
+      this.mcpInitialized = true;
+      try {
+        await this.mcpManager.loadAndConnect();
+        const mcpDefs = this.mcpManager.getToolDefinitions();
+        if (mcpDefs.length > 0) {
+          this.tools = [...this.tools, ...mcpDefs as ToolDef[]];
+        }
+      } catch (err: any) {
+        console.error(`[mcp] Init failed: ${err.message}`);
+      }
+    }
     this.abortController = new AbortController();
     try {
       if (this.useOpenAI) {
@@ -672,6 +733,28 @@ export class Agent {
 
   // ─── Execute tool (handles agent tool internally) ─────────
 
+  // ─── Large result persistence ───────────────────────────────
+  // When a tool result exceeds 30 KB, write it to disk and replace the
+  // context entry with a short preview + file path.  The model can use
+  // read_file to retrieve the full output later — no information is lost.
+
+  private persistLargeResult(toolName: string, result: string): string {
+    const THRESHOLD = 30 * 1024; // 30 KB
+    if (Buffer.byteLength(result) <= THRESHOLD) return result;
+
+    const dir = join(homedir(), ".mini-claude", "tool-results");
+    mkdirSync(dir, { recursive: true });
+    const filename = `${Date.now()}-${toolName}.txt`;
+    const filepath = join(dir, filename);
+    writeFileSync(filepath, result);
+
+    const lines = result.split("\n");
+    const preview = lines.slice(0, 200).join("\n");
+    const sizeKB = (Buffer.byteLength(result) / 1024).toFixed(1);
+
+    return `[Result too large (${sizeKB} KB, ${lines.length} lines). Full output saved to ${filepath}. You can use read_file to see the full result.]\n\nPreview (first 200 lines):\n${preview}`;
+  }
+
   private async executeToolCall(
     name: string,
     input: Record<string, any>
@@ -679,7 +762,9 @@ export class Agent {
     if (name === "enter_plan_mode" || name === "exit_plan_mode") return await this.executePlanModeTool(name);
     if (name === "agent") return this.executeAgentTool(input);
     if (name === "skill") return this.executeSkillTool(input);
-    return executeTool(name, input);
+    // Route MCP tool calls to the MCP manager
+    if (this.mcpManager.isMcpTool(name)) return this.mcpManager.callTool(name, input);
+    return executeTool(name, input, this.readFileState);
   }
 
   // ─── Skill fork mode ─────────────────────────────────────
@@ -883,14 +968,73 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
   private async chatAnthropic(userMessage: string): Promise<void> {
     this.anthropicMessages.push({ role: "user", content: userMessage });
 
+    // Start async memory prefetch (non-blocking, fires once per user turn)
+    let memoryPrefetch: MemoryPrefetch | null = null;
+    if (!this.isSubAgent) {
+      const sq = this.buildSideQuery();
+      if (sq) {
+        memoryPrefetch = startMemoryPrefetch(
+          userMessage, sq,
+          this.alreadySurfacedMemories, this.sessionMemoryBytes,
+          this.abortController?.signal,
+        );
+      }
+    }
+
+    let firstIteration = true;
+
     while (true) {
       if (this.abortController?.signal.aborted) break;
 
       // Run compression pipeline before API call (tiers 1-3 are zero-cost)
       this.runCompressionPipeline();
 
+      // Consume memory prefetch if settled (non-blocking poll, zero-wait).
+      // Checked every iteration so the model sees recalled memories ASAP.
+      // Memories are appended to the last user message (or added as a new one)
+      // to avoid consecutive user messages which violate the API's alternation rule.
+      if (memoryPrefetch && memoryPrefetch.settled && !memoryPrefetch.consumed) {
+        memoryPrefetch.consumed = true;
+        try {
+          const memories = await memoryPrefetch.promise;
+          if (memories.length > 0) {
+            const injectionText = formatMemoriesForInjection(memories);
+            const last = this.anthropicMessages[this.anthropicMessages.length - 1];
+            if (last && last.role === "user") {
+              // Append to existing user message to maintain alternation
+              if (typeof last.content === "string") {
+                last.content = last.content + "\n\n" + injectionText;
+              } else if (Array.isArray(last.content)) {
+                (last.content as any[]).push({ type: "text", text: injectionText });
+              }
+            } else {
+              this.anthropicMessages.push({ role: "user", content: injectionText });
+            }
+            for (const m of memories) {
+              this.alreadySurfacedMemories.add(m.path);
+              this.sessionMemoryBytes += Buffer.byteLength(m.content);
+            }
+          }
+        } catch { /* prefetch errors already logged */ }
+      }
+
       if (!this.isSubAgent) startSpinner();
-      const response = await this.callAnthropicStream();
+
+      // ── Streaming tool execution ──────────────────────────────
+      // As each tool_use content block completes during streaming, check
+      // if it's concurrency-safe and auto-allowed. If so, start execution
+      // immediately — the tool runs while the model still generates.
+      const earlyExecutions = new Map<string, Promise<string>>();
+
+      const response = await this.callAnthropicStream((block) => {
+        const input = block.input as Record<string, any>;
+        if (CONCURRENCY_SAFE_TOOLS.has(block.name)) {
+          const perm = checkPermission(block.name, input, this.permissionMode, this.planFilePath || undefined);
+          if (perm.action === "allow") {
+            earlyExecutions.set(block.id, this.executeToolCall(block.name, input));
+          }
+        }
+      });
       if (!this.isSubAgent) stopSpinner();
       this.lastApiCallTime = Date.now();
       this.totalInputTokens += response.usage.input_tokens;
@@ -927,73 +1071,83 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
 
       const toolResults: Anthropic.ToolResultBlockParam[] = [];
 
+      // Process tools: early-started ones (from streaming) just await their
+      // result; others go through permission check + execution as before.
+      let contextBreak = false;
       for (const toolUse of toolUses) {
-        if (this.abortController?.signal.aborted) break;
+        if (contextBreak || this.abortController?.signal.aborted) break;
         const input = toolUse.input as Record<string, any>;
         printToolCall(toolUse.name, input);
 
-        // Permission check (mode-aware)
+        // Was this tool already started during streaming?
+        const earlyPromise = earlyExecutions.get(toolUse.id);
+        if (earlyPromise) {
+          const raw = await earlyPromise;
+          const res = this.persistLargeResult(toolUse.name, raw);
+          printToolResult(toolUse.name, res);
+          toolResults.push({ type: "tool_result", tool_use_id: toolUse.id, content: res });
+          continue;
+        }
+
+        // Permission check for tools not started early
         const perm = checkPermission(toolUse.name, input, this.permissionMode, this.planFilePath || undefined);
         if (perm.action === "deny") {
           printInfo(`Denied: ${perm.message}`);
-          toolResults.push({
-            type: "tool_result",
-            tool_use_id: toolUse.id,
-            content: `Action denied: ${perm.message}`,
-          });
+          toolResults.push({ type: "tool_result", tool_use_id: toolUse.id, content: `Action denied: ${perm.message}` });
           continue;
         }
         if (perm.action === "confirm" && perm.message && !this.confirmedPaths.has(perm.message)) {
           const confirmed = await this.confirmDangerous(perm.message);
           if (!confirmed) {
-            toolResults.push({
-              type: "tool_result",
-              tool_use_id: toolUse.id,
-              content: "User denied this action.",
-            });
+            toolResults.push({ type: "tool_result", tool_use_id: toolUse.id, content: "User denied this action." });
             continue;
           }
           this.confirmedPaths.add(perm.message);
         }
 
-        const result = await this.executeToolCall(toolUse.name, input);
-        printToolResult(toolUse.name, result);
+        const raw = await this.executeToolCall(toolUse.name, input);
+        const res = this.persistLargeResult(toolUse.name, raw);
+        printToolResult(toolUse.name, res);
 
-        // If context was cleared (plan approval with clear), inject as user message instead
         if (this.contextCleared) {
           this.contextCleared = false;
-          this.anthropicMessages.push({ role: "user", content: result });
-          break; // Skip remaining tool results, start fresh
+          this.anthropicMessages.push({ role: "user", content: res });
+          contextBreak = true;
+          break;
         }
-
-        toolResults.push({
-          type: "tool_result",
-          tool_use_id: toolUse.id,
-          content: result,
-        });
+        toolResults.push({ type: "tool_result", tool_use_id: toolUse.id, content: res });
       }
 
-      if (!this.contextCleared && toolResults.length > 0) {
+      if (!contextBreak && !this.contextCleared && toolResults.length > 0) {
         this.anthropicMessages.push({ role: "user", content: toolResults });
       }
       this.contextCleared = false;
+
+
+      firstIteration = false;
       await this.checkAndCompact();
     }
   }
 
-  private async callAnthropicStream(): Promise<Anthropic.Message> {
+  /**
+   * Stream an Anthropic API call. When a tool_use content block finishes
+   * during streaming, `onToolBlockComplete` fires immediately so the caller
+   * can start execution before the full response arrives (streaming tool
+   * execution — mirrors Claude Code's content_block_stop approach).
+   */
+  private async callAnthropicStream(
+    onToolBlockComplete?: (block: Anthropic.ToolUseBlock) => void,
+  ): Promise<Anthropic.Message> {
     return withRetry(async (signal) => {
       const maxOutput = getMaxOutputTokens(this.model);
       const createParams: any = {
         model: this.model,
         max_tokens: this.thinkingMode !== "disabled" ? maxOutput : 16384,
         system: this.systemPrompt,
-        tools: this.tools,
+        tools: getActiveToolDefinitions(this.tools),
         messages: this.anthropicMessages,
       };
 
-      // Extended thinking support (Anthropic only)
-      // Mirrors Claude Code: adaptive for 4.6 models, enabled with budget for older
       if (this.thinkingMode === "adaptive") {
         createParams.thinking = { type: "enabled", budget_tokens: maxOutput - 1 };
       } else if (this.thinkingMode === "enabled") {
@@ -1009,27 +1163,53 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
         this.emitText(text);
       });
 
-      // Stream thinking content if enabled (SDK high-level event)
-      if (this.thinkingMode !== "disabled") {
-        let inThinking = false;
-        stream.on("streamEvent" as any, (event: any) => {
-          if (event.type === "content_block_start" && event.content_block?.type === "thinking") {
+      // ── Unified streamEvent handler for thinking + tool tracking ──
+      // Track in-flight tool_use blocks by index. When content_block_stop
+      // fires for a tool_use, parse accumulated JSON and notify caller
+      // so it can start execution while later blocks still stream.
+      const toolBlocksByIndex = new Map<number, { id: string; name: string; inputJson: string }>();
+      let inThinking = false;
+
+      stream.on("streamEvent" as any, (event: any) => {
+        // Thinking passthrough
+        if (event.type === "content_block_start" && event.content_block?.type === "thinking") {
+          if (this.thinkingMode !== "disabled") {
             inThinking = true;
             stopSpinner();
             this.emitText("\n" + chalk.dim("  [thinking] "));
-          } else if (event.type === "content_block_delta" && event.delta?.type === "thinking_delta" && inThinking) {
-            this.emitText(chalk.dim(event.delta.thinking));
-          } else if (event.type === "content_block_stop" && inThinking) {
-            this.emitText("\n");
-            inThinking = false;
           }
-        });
-      }
+        } else if (event.type === "content_block_delta" && event.delta?.type === "thinking_delta" && inThinking) {
+          this.emitText(chalk.dim(event.delta.thinking));
+        }
+
+        // Tool block tracking: accumulate input JSON as it streams
+        if (event.type === "content_block_start" && event.content_block?.type === "tool_use") {
+          toolBlocksByIndex.set(event.index, {
+            id: event.content_block.id,
+            name: event.content_block.name,
+            inputJson: "",
+          });
+        } else if (event.type === "content_block_delta" && event.delta?.type === "input_json_delta") {
+          const tb = toolBlocksByIndex.get(event.index);
+          if (tb) tb.inputJson += event.delta.partial_json;
+        }
+
+        // content_block_stop: finalize thinking or fire tool callback
+        if (event.type === "content_block_stop") {
+          if (inThinking) { this.emitText("\n"); inThinking = false; }
+          const tb = toolBlocksByIndex.get(event.index);
+          if (tb && onToolBlockComplete) {
+            let parsedInput: Record<string, any> = {};
+            try { parsedInput = JSON.parse(tb.inputJson || "{}"); } catch {}
+            onToolBlockComplete({ type: "tool_use", id: tb.id, name: tb.name, input: parsedInput });
+            toolBlocksByIndex.delete(event.index);
+          }
+        }
+      });
 
       const finalMessage = await stream.finalMessage();
 
       // Filter out thinking blocks from stored history
-      // (Claude Code preserves redacted blocks, but for simplicity we strip them)
       finalMessage.content = finalMessage.content.filter(
         (block: any) => block.type !== "thinking"
       );
@@ -1043,11 +1223,44 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
   private async chatOpenAI(userMessage: string): Promise<void> {
     this.openaiMessages.push({ role: "user", content: userMessage });
 
+    // Start async memory prefetch (non-blocking, fires once per user turn)
+    let memoryPrefetch: MemoryPrefetch | null = null;
+    if (!this.isSubAgent) {
+      const sq = this.buildSideQuery();
+      if (sq) {
+        memoryPrefetch = startMemoryPrefetch(
+          userMessage, sq,
+          this.alreadySurfacedMemories, this.sessionMemoryBytes,
+        );
+      }
+    }
+
     while (true) {
       if (this.abortController?.signal.aborted) break;
 
       // Run compression pipeline before API call
       this.runCompressionPipeline();
+
+      // Consume memory prefetch if settled (non-blocking poll, zero-wait)
+      if (memoryPrefetch && memoryPrefetch.settled && !memoryPrefetch.consumed) {
+        memoryPrefetch.consumed = true;
+        try {
+          const memories = await memoryPrefetch.promise;
+          if (memories.length > 0) {
+            const injectionText = formatMemoriesForInjection(memories);
+            const last = this.openaiMessages[this.openaiMessages.length - 1];
+            if (last && last.role === "user") {
+              last.content = (last.content || "") + "\n\n" + injectionText;
+            } else {
+              this.openaiMessages.push({ role: "user", content: injectionText });
+            }
+            for (const m of memories) {
+              this.alreadySurfacedMemories.add(m.path);
+              this.sessionMemoryBytes += Buffer.byteLength(m.content);
+            }
+          }
+        } catch { /* prefetch errors already logged */ }
+      }
 
       if (!this.isSubAgent) startSpinner();
       const response = await this.callOpenAIStream();
@@ -1085,59 +1298,82 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
         break;
       }
 
-      // Execute tool calls
+      // Phase 1: Parse & permission-check all tool calls (serial — user interaction)
+      type OAIChecked = { tc: typeof toolCalls[0]; fnName: string; input: Record<string, any>; allowed: boolean; result?: string };
+      const oaiChecked: OAIChecked[] = [];
       for (const tc of toolCalls) {
         if (this.abortController?.signal.aborted) break;
         if (tc.type !== "function") continue;
         const fnName = tc.function.name;
         let input: Record<string, any>;
-        try {
-          input = JSON.parse(tc.function.arguments);
-        } catch {
-          input = {};
-        }
+        try { input = JSON.parse(tc.function.arguments); } catch { input = {}; }
 
         printToolCall(fnName, input);
 
-        // Permission check (mode-aware)
         const perm = checkPermission(fnName, input, this.permissionMode, this.planFilePath || undefined);
         if (perm.action === "deny") {
           printInfo(`Denied: ${perm.message}`);
-          this.openaiMessages.push({
-            role: "tool",
-            tool_call_id: tc.id,
-            content: `Action denied: ${perm.message}`,
-          });
+          oaiChecked.push({ tc, fnName, input, allowed: false, result: `Action denied: ${perm.message}` });
           continue;
         }
         if (perm.action === "confirm" && perm.message && !this.confirmedPaths.has(perm.message)) {
           const confirmed = await this.confirmDangerous(perm.message);
           if (!confirmed) {
-            this.openaiMessages.push({
-              role: "tool",
-              tool_call_id: tc.id,
-              content: "User denied this action.",
-            });
+            oaiChecked.push({ tc, fnName, input, allowed: false, result: "User denied this action." });
             continue;
           }
           this.confirmedPaths.add(perm.message);
         }
+        oaiChecked.push({ tc, fnName, input, allowed: true });
+      }
 
-        const result = await this.executeToolCall(fnName, input);
-        printToolResult(fnName, result);
-
-        // If context was cleared (plan approval with clear), inject as user message
-        if (this.contextCleared) {
-          this.contextCleared = false;
-          this.openaiMessages.push({ role: "user", content: result });
-          break;
+      // Phase 2: Group & execute (parallel for consecutive safe tools)
+      type OAIBatch = { concurrent: boolean; items: OAIChecked[] };
+      const oaiBatches: OAIBatch[] = [];
+      for (const ct of oaiChecked) {
+        const safe = ct.allowed && CONCURRENCY_SAFE_TOOLS.has(ct.fnName);
+        if (safe && oaiBatches.length > 0 && oaiBatches[oaiBatches.length - 1].concurrent) {
+          oaiBatches[oaiBatches.length - 1].items.push(ct);
+        } else {
+          oaiBatches.push({ concurrent: safe, items: [ct] });
         }
+      }
 
-        this.openaiMessages.push({
-          role: "tool",
-          tool_call_id: tc.id,
-          content: result,
-        });
+      let oaiContextBreak = false;
+      for (const batch of oaiBatches) {
+        if (oaiContextBreak || this.abortController?.signal.aborted) break;
+
+        if (batch.concurrent) {
+          const results = await Promise.all(
+            batch.items.map(async (ct) => {
+              const raw = await this.executeToolCall(ct.fnName, ct.input);
+              const res = this.persistLargeResult(ct.fnName, raw);
+              printToolResult(ct.fnName, res);
+              return { ct, res };
+            })
+          );
+          for (const { ct, res } of results) {
+            this.openaiMessages.push({ role: "tool", tool_call_id: ct.tc.id, content: res });
+          }
+        } else {
+          for (const ct of batch.items) {
+            if (!ct.allowed) {
+              this.openaiMessages.push({ role: "tool", tool_call_id: ct.tc.id, content: ct.result! });
+              continue;
+            }
+            const raw = await this.executeToolCall(ct.fnName, ct.input);
+            const res = this.persistLargeResult(ct.fnName, raw);
+            printToolResult(ct.fnName, res);
+
+            if (this.contextCleared) {
+              this.contextCleared = false;
+              this.openaiMessages.push({ role: "user", content: res });
+              oaiContextBreak = true;
+              break;
+            }
+            this.openaiMessages.push({ role: "tool", tool_call_id: ct.tc.id, content: res });
+          }
+        }
       }
 
       this.contextCleared = false;
@@ -1150,7 +1386,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
       const stream = await this.openaiClient!.chat.completions.create({
         model: this.model,
         max_tokens: 16384,
-        tools: toOpenAITools(this.tools),
+        tools: toOpenAITools(getActiveToolDefinitions(this.tools)),
         messages: this.openaiMessages,
         stream: true,
         stream_options: { include_usage: true },

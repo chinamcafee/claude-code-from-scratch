@@ -11,6 +11,7 @@ from pathlib import Path
 from .memory import build_memory_prompt_section
 from .skills import build_skill_descriptions
 from .subagent import build_agent_descriptions
+from .tools import get_deferred_tool_names
 
 # ─── System prompt template (embedded) ──────────────────────
 
@@ -94,27 +95,99 @@ Shell: {{shell}}
 {{claude_md}}
 {{memory}}
 {{skills}}
-{{agents}}"""
+{{agents}}
+{{deferred_tools}}"""
+
+
+import re as _re
+
+# ─── @include resolution ─────────────────────────────────────
+# Resolves @./path, @~/path, @/path references in CLAUDE.md files.
+
+_INCLUDE_RE = _re.compile(r"^@(\./[^\s]+|~/[^\s]+|/[^\s]+)$", _re.MULTILINE)
+_MAX_INCLUDE_DEPTH = 5
+
+
+def _resolve_includes(
+    content: str,
+    base_path: Path,
+    visited: set[str] | None = None,
+    depth: int = 0,
+) -> str:
+    if depth >= _MAX_INCLUDE_DEPTH:
+        return content
+    if visited is None:
+        visited = set()
+
+    def _replace(m: _re.Match) -> str:
+        raw = m.group(1)
+        if raw.startswith("~/"):
+            resolved = Path.home() / raw[2:]
+        elif raw.startswith("/"):
+            resolved = Path(raw)
+        else:
+            resolved = base_path / raw
+        resolved = resolved.resolve()
+        key = str(resolved)
+        if key in visited:
+            return f"<!-- circular: {raw} -->"
+        if not resolved.is_file():
+            return f"<!-- not found: {raw} -->"
+        try:
+            visited.add(key)
+            included = resolved.read_text()
+            return _resolve_includes(included, resolved.parent, visited, depth + 1)
+        except Exception:
+            return f"<!-- error reading: {raw} -->"
+
+    return _INCLUDE_RE.sub(_replace, content)
+
+
+def _load_rules_dir(directory: Path) -> str:
+    """Load all .md files from .claude/rules/ directory."""
+    rules_dir = directory / ".claude" / "rules"
+    if not rules_dir.is_dir():
+        return ""
+    try:
+        files = sorted(f for f in rules_dir.iterdir() if f.suffix == ".md" and f.is_file())
+        if not files:
+            return ""
+        parts: list[str] = []
+        for f in files:
+            try:
+                content = f.read_text()
+                content = _resolve_includes(content, rules_dir)
+                parts.append(f"<!-- rule: {f.name} -->\n{content}")
+            except Exception:
+                pass
+        return "\n\n## Rules\n" + "\n\n".join(parts) if parts else ""
+    except Exception:
+        return ""
 
 
 def load_claude_md() -> str:
-    """Walk up from cwd collecting all CLAUDE.md files."""
+    """Walk up from cwd collecting all CLAUDE.md files, resolving @includes."""
     parts: list[str] = []
     d = Path.cwd().resolve()
     while True:
         f = d / "CLAUDE.md"
         if f.is_file():
             try:
-                parts.insert(0, f.read_text())
+                content = f.read_text()
+                content = _resolve_includes(content, d)
+                parts.insert(0, content)
             except Exception:
                 pass
         parent = d.parent
         if parent == d:
             break
         d = parent
+    # Load .claude/rules/*.md from cwd
+    rules = _load_rules_dir(Path.cwd())
+    claude_md = ""
     if parts:
-        return "\n\n# Project Instructions (CLAUDE.md)\n" + "\n\n---\n\n".join(parts)
-    return ""
+        claude_md = "\n\n# Project Instructions (CLAUDE.md)\n" + "\n\n---\n\n".join(parts)
+    return claude_md + rules
 
 
 def get_git_context() -> str:
@@ -146,6 +219,12 @@ def build_system_prompt() -> str:
     skills_section = build_skill_descriptions()
     agent_section = build_agent_descriptions()
 
+    deferred_names = get_deferred_tool_names()
+    deferred_section = (
+        f"\n\nThe following deferred tools are available via tool_search: {', '.join(deferred_names)}. Use tool_search to fetch their full schemas when needed."
+        if deferred_names else ""
+    )
+
     replacements = {
         "{{cwd}}": str(Path.cwd()),
         "{{date}}": today,
@@ -156,6 +235,7 @@ def build_system_prompt() -> str:
         "{{memory}}": memory_section,
         "{{skills}}": skills_section,
         "{{agents}}": agent_section,
+        "{{deferred_tools}}": deferred_section,
     }
     result = SYSTEM_PROMPT_TEMPLATE
     for key, value in replacements.items():

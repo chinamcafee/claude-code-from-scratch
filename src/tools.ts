@@ -1,7 +1,7 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, statSync } from "fs";
 import { execSync, execFileSync } from "child_process";
 import { glob } from "glob";
-import { dirname, join, basename, extname } from "path";
+import { dirname, join, basename, extname, resolve } from "path";
 import { homedir } from "os";
 
 const isWin = process.platform === "win32";
@@ -14,11 +14,14 @@ import type Anthropic from "@anthropic-ai/sdk";
 
 export type PermissionMode = "default" | "plan" | "acceptEdits" | "bypassPermissions" | "dontAsk";
 
-const READ_TOOLS = new Set(["read_file", "list_files", "grep_search"]);
+const READ_TOOLS = new Set(["read_file", "list_files", "grep_search", "web_fetch"]);
 const EDIT_TOOLS = new Set(["write_file", "edit_file"]);
 
-// Tool definition type for Claude API
-export type ToolDef = Anthropic.Tool;
+// Concurrency-safe tools can run in parallel (read-only, no side effects)
+export const CONCURRENCY_SAFE_TOOLS = new Set(["read_file", "list_files", "grep_search", "web_fetch"]);
+
+// Tool definition type for Claude API (with optional deferred flag)
+export type ToolDef = Anthropic.Tool & { deferred?: boolean };
 
 // ─── Tool definitions ───────────────────────────────────────
 
@@ -164,6 +167,23 @@ export const toolDefinitions: ToolDef[] = [
       required: ["skill_name"],
     },
   },
+  // ─── Web fetch tool ──────────────────────────────────────────
+  {
+    name: "web_fetch",
+    description:
+      "Fetch a URL and return its content as text. For HTML pages, tags are stripped to return readable text. For JSON/text responses, content is returned directly.",
+    input_schema: {
+      type: "object" as const,
+      properties: {
+        url: { type: "string", description: "The URL to fetch" },
+        max_length: {
+          type: "number",
+          description: "Maximum content length in characters (default 50000)",
+        },
+      },
+      required: ["url"],
+    },
+  },
   // ─── Plan mode tools ────────────────────────────────────────
   {
     name: "enter_plan_mode",
@@ -173,6 +193,7 @@ export const toolDefinitions: ToolDef[] = [
       type: "object" as const,
       properties: {},
     },
+    deferred: true,
   },
   {
     name: "exit_plan_mode",
@@ -182,6 +203,7 @@ export const toolDefinitions: ToolDef[] = [
       type: "object" as const,
       properties: {},
     },
+    deferred: true,
   },
   // ─── Agent tool ─────────────────────────────────────────────
   {
@@ -208,7 +230,45 @@ export const toolDefinitions: ToolDef[] = [
       required: ["description", "prompt"],
     },
   },
+  // ─── Tool search (deferred tool loader) ─────────────────────
+  {
+    name: "tool_search",
+    description:
+      "Search for available tools by name or keyword. Returns full schema definitions for matching deferred tools so you can use them.",
+    input_schema: {
+      type: "object" as const,
+      properties: {
+        query: { type: "string", description: "Tool name or search keywords" },
+      },
+      required: ["query"],
+    },
+  },
 ];
+
+// ─── Deferred tool activation ───────────────────────────────
+// Deferred tools only send their name (not schema) to save tokens.
+// When the model calls tool_search, matching tools get activated
+// and their full schemas are included in subsequent API calls.
+
+const activatedTools = new Set<string>();
+
+export function resetActivatedTools(): void {
+  activatedTools.clear();
+}
+
+export function getActiveToolDefinitions(allTools?: ToolDef[]): Anthropic.Tool[] {
+  const tools = allTools || toolDefinitions;
+  return tools
+    .filter(t => !t.deferred || activatedTools.has(t.name))
+    .map(({ deferred, ...rest }) => rest);
+}
+
+export function getDeferredToolNames(allTools?: ToolDef[]): string[] {
+  const tools = allTools || toolDefinitions;
+  return tools
+    .filter(t => t.deferred && !activatedTools.has(t.name))
+    .map(t => t.name);
+}
 
 // ─── Tool execution ─────────────────────────────────────────
 
@@ -662,21 +722,58 @@ function truncateResult(result: string): string {
 
 export async function executeTool(
   name: string,
-  input: Record<string, any>
+  input: Record<string, any>,
+  readFileState?: Map<string, number>
 ): Promise<string> {
   let result: string;
   switch (name) {
     case "read_file":
       result = readFile(input as { file_path: string });
+      // Track mtime so edit_file/write_file can verify freshness
+      if (readFileState && !result.startsWith("Error")) {
+        const absPath = resolve(input.file_path);
+        try { readFileState.set(absPath, statSync(absPath).mtimeMs); } catch {}
+      }
       break;
-    case "write_file":
+    case "write_file": {
+      const absPath = resolve(input.file_path);
+      // Existing files require a prior read; new files skip the check
+      if (readFileState && existsSync(absPath)) {
+        if (!readFileState.has(absPath)) {
+          return "Error: You must read this file before writing. Use read_file first to see its current contents.";
+        }
+        const cur = statSync(absPath).mtimeMs;
+        const rec = readFileState.get(absPath)!;
+        if (cur !== rec) {
+          return `Warning: ${input.file_path} was modified externally since your last read. Please read_file again before writing.`;
+        }
+      }
       result = writeFile(input as { file_path: string; content: string });
+      if (readFileState && !result.startsWith("Error")) {
+        try { readFileState.set(absPath, statSync(absPath).mtimeMs); } catch {}
+      }
       break;
-    case "edit_file":
+    }
+    case "edit_file": {
+      const absPath = resolve(input.file_path);
+      if (readFileState && existsSync(absPath)) {
+        if (!readFileState.has(absPath)) {
+          return "Error: You must read this file before editing. Use read_file first to see its current contents.";
+        }
+        const cur = statSync(absPath).mtimeMs;
+        const rec = readFileState.get(absPath)!;
+        if (cur !== rec) {
+          return `Warning: ${input.file_path} was modified externally since your last read. Please read_file again before editing.`;
+        }
+      }
       result = editFile(
         input as { file_path: string; old_string: string; new_string: string }
       );
+      if (readFileState && existsSync(absPath) && !result.startsWith("Error")) {
+        try { readFileState.set(absPath, statSync(absPath).mtimeMs); } catch {}
+      }
       break;
+    }
     case "list_files":
       result = await listFiles(input as { pattern: string; path?: string });
       break;
@@ -688,6 +785,66 @@ export async function executeTool(
     case "run_shell":
       result = runShell(input as { command: string; timeout?: number });
       break;
+    case "web_fetch": {
+      const url = input.url as string;
+      const maxLength = (input.max_length as number) || 50000;
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 30000);
+      try {
+        const res = await fetch(url, {
+          signal: controller.signal,
+          headers: { "User-Agent": "mini-claude/1.0" },
+        });
+        clearTimeout(timeout);
+        if (!res.ok) {
+          result = `HTTP error: ${res.status} ${res.statusText}`;
+          break;
+        }
+        const contentType = res.headers.get("content-type") || "";
+        let text = await res.text();
+        if (contentType.includes("html")) {
+          text = text
+            .replace(/<script[\s\S]*?<\/script>/gi, "")
+            .replace(/<style[\s\S]*?<\/style>/gi, "")
+            .replace(/<[^>]*>/g, " ")
+            .replace(/&nbsp;/g, " ")
+            .replace(/&amp;/g, "&")
+            .replace(/&lt;/g, "<")
+            .replace(/&gt;/g, ">")
+            .replace(/&quot;/g, '"')
+            .replace(/\s{2,}/g, " ")
+            .replace(/\n{3,}/g, "\n\n")
+            .trim();
+        }
+        if (text.length > maxLength) {
+          text = text.slice(0, maxLength) + `\n\n[... truncated at ${maxLength} characters]`;
+        }
+        result = text || "(empty response)";
+      } catch (err: any) {
+        clearTimeout(timeout);
+        if (err.name === "AbortError") {
+          result = "Error: Request timed out (30s)";
+        } else {
+          result = `Error fetching ${url}: ${err.message}`;
+        }
+      }
+      break;
+    }
+    case "tool_search": {
+      const query = (input.query as string || "").toLowerCase();
+      const deferred = toolDefinitions.filter(t => t.deferred);
+      const matches = deferred.filter(t =>
+        t.name.toLowerCase().includes(query) ||
+        (t.description || "").toLowerCase().includes(query)
+      );
+      if (matches.length === 0) return "No matching deferred tools found.";
+      for (const m of matches) activatedTools.add(m.name);
+      return JSON.stringify(matches.map(t => ({
+        name: t.name,
+        description: t.description,
+        input_schema: t.input_schema,
+      })), null, 2);
+    }
     // "skill" and "agent" are handled in agent.ts (to support fork mode and avoid circular deps)
     default:
       return `Unknown tool: ${name}`;

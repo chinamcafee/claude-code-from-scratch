@@ -1,4 +1,4 @@
-# 6. 上下文管理
+# 7. 上下文管理
 
 ## 本章目标
 
@@ -6,7 +6,10 @@
 
 ```mermaid
 graph TD
-    Tool[工具执行结果] --> Trunc{"&gt; 50K 字符?"}
+    Tool[工具执行结果] --> Persist{"&gt; 30KB?"}
+    Persist -->|是| Disk["持久化到磁盘<br/>保留预览+路径"]
+    Persist -->|否| Trunc{"&gt; 50K 字符?"}
+    Disk --> T1
     Trunc -->|是| Cut["截断：保留头尾"]
     Trunc -->|否| Pass[直接返回]
     Cut --> T1
@@ -17,6 +20,8 @@ graph TD
     T3 -->|"空闲 &gt;5min<br/>cache 已冷"| T4["Tier 4: Auto-compact<br/>全量摘要"]
     T4 -->|"&gt;85% 窗口"| Summary[LLM 摘要替换]
 
+    style Persist fill:#d4edda
+    style Disk fill:#d4edda
     style Trunc fill:#e8e0ff
     style T1 fill:#e8e0ff
     style T2 fill:#e8e0ff
@@ -102,7 +107,40 @@ def _truncate_result(result: str) -> str:
 
 保留头尾而非只保留头部：文件开头有 imports、类定义等结构信息，命令输出的错误摘要通常在最后。
 
-与 Claude Code 的区别：Claude Code 持久化到磁盘，模型后续可用 Read 工具取回完整内容。我们直接截断（不可恢复），是合理的复杂度取舍。
+与 Claude Code 的区别：Claude Code 持久化到磁盘，模型后续可用 Read 工具取回完整内容。我们现在也实现了持久化——见下方 persistLargeResult。两层配合：persistLargeResult 先拦截 >30KB 的结果保存到磁盘，truncateResult 再处理通过第一层但仍超过 50K 的内容。
+
+### 第 0.5 层：大结果持久化（persistLargeResult）
+
+当工具返回结果超过 30KB 时，将完整内容写入磁盘，上下文中只保留预览和文件路径。模型后续可以用 `read_file` 按需取回完整输出。
+
+```typescript
+// agent.ts — persistLargeResult
+
+private persistLargeResult(toolName: string, result: string): string {
+  const THRESHOLD = 30 * 1024; // 30 KB
+  if (Buffer.byteLength(result) <= THRESHOLD) return result;
+
+  const dir = join(homedir(), ".mini-claude", "tool-results");
+  mkdirSync(dir, { recursive: true });
+  const filename = `${Date.now()}-${toolName}.txt`;
+  const filepath = join(dir, filename);
+  writeFileSync(filepath, result);
+
+  const lines = result.split("\n");
+  const preview = lines.slice(0, 200).join("\n");
+  const sizeKB = (Buffer.byteLength(result) / 1024).toFixed(1);
+
+  return `[Result too large (${sizeKB} KB, ${lines.length} lines). Full output saved to ${filepath}. You can use read_file to see the full result.]\n\nPreview (first 200 lines):\n${preview}`;
+}
+```
+
+这一层的设计要点：
+
+- **30KB 阈值低于 truncateResult 的 50K 限制**：在截断发生之前先拦截大结果，避免不可逆的信息丢失。如果一个结果有 80KB，persistLargeResult 会先将完整内容保存到磁盘，返回预览；而不是等 truncateResult 把中间部分永久丢弃。
+- **200 行预览**：给模型足够的上下文来判断是否需要读取完整输出。大多数情况下，前 200 行已经包含了关键信息（文件列表的开头、搜索结果的前几个匹配、命令输出的主要内容）。
+- **可恢复 vs 不可恢复**：这是与 truncateResult 的根本区别。truncateResult 是不可逆的——被截掉的内容永远消失了。persistLargeResult 把数据保存到 `~/.mini-claude/tool-results/{timestamp}-{toolName}.txt`，模型随时可以用 `read_file` 取回。
+- **调用时机**：在主循环中每次工具执行完成后、结果添加到消息之前调用。这意味着它在 truncateResult 之前生效——先尝试保存，保存后返回的预览文本通常远小于 50K，不会再触发截断。
+- **与 Claude Code 的对齐**：这一设计直接对应 Claude Code 的 Level 1 策略（持久化到磁盘，上下文中只保留引用）。区别在于 Claude Code 用 2KB 预览，我们用 200 行——思路相同，实现简化。
 
 ### 第 1 层：Budget — 动态缩减工具结果
 
@@ -468,8 +506,8 @@ Tier 1-3 在 API 调用**前**运行（零 API 成本），Tier 4 在 API 调用
 | **Snip 策略** | 选择性裁剪 + cache 感知 | 同文件去重 + 保留最近 3 个 |
 | **Microcompact** | 时间路径 + 缓存编辑路径 | 只有 5 分钟空闲触发 |
 | **Auto-compact** | 两阶段摘要 + 压缩后恢复 + 熔断器 | 单段摘要，无恢复 |
-| **溢出存储** | 磁盘持久化，可按需读取 | 就地修改（不可恢复） |
+| **溢出存储** | 磁盘持久化，可按需读取 | 磁盘持久化（>30KB），可按需读取 |
 
 ---
 
-> **下一章**：底层引擎已经完成。把它包装成一个好用的 CLI 工具——参数解析、REPL 交互、会话持久化。
+> **下一章**：让 Agent 跨会话记住信息——记忆系统。
