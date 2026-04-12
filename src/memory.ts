@@ -295,6 +295,22 @@ export interface MemoryPrefetch {
  *   - Input must have multiple words
  *   - Session memory budget not exceeded
  */
+/** Check if query contains enough meaningful content (CJK chars or multi-word). */
+function isQuerySubstantial(query: string): boolean {
+  const trimmed = query.trim();
+  if (trimmed.length === 0) return false;
+  
+  // Check for CJK characters (Chinese, Japanese, Korean)
+  const cjkRegex = /[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]/g;
+  const cjkMatches = trimmed.match(cjkRegex);
+  if (cjkMatches && cjkMatches.length >= 2) return true;
+  
+  // Fallback: multi-word input (contains whitespace)
+  if (/\s/.test(trimmed)) return true;
+  
+  return false;
+}
+
 export function startMemoryPrefetch(
   query: string,
   sideQuery: SideQueryFn,
@@ -302,8 +318,8 @@ export function startMemoryPrefetch(
   sessionMemoryBytes: number,
   signal?: AbortSignal,
 ): MemoryPrefetch | null {
-  // Gate: multi-word input only
-  if (!/\s/.test(query.trim())) return null;
+  // Gate: substantial input (CJK chars or multi-word)
+  if (!isQuerySubstantial(query)) return null;
 
   // Gate: session budget
   if (sessionMemoryBytes >= MAX_SESSION_MEMORY_BYTES) return null;
