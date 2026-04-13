@@ -1,3 +1,34 @@
+# 第 9-1 节：先搭好基础打印函数和工具摘要辅助函数
+
+这一小节结束后，你拿到的不是最终版 `src/ui.ts`，而是一个已经能承担大部分普通终端输出的阶段版。
+
+这个阶段版先把欢迎语、用户提示符、工具结果输出、错误/信息提示，以及工具图标与摘要辅助函数接上。
+
+## 本小节目标
+
+1. 导出 `printWelcome()`、`printUserPrompt()`、`printToolCall()`、`printToolResult()`、`printError()`、`printInfo()` 等基础函数。
+2. 能正确为不同工具生成摘要。
+3. 能在终端里看到带颜色的基础输出。
+4. 成功编译当前工程。
+
+## 这份阶段版源码来自哪里
+
+这一小节的阶段版 `src/ui.ts` 完全由参考文件中的这些原始片段拼成：
+
+- 第 1-118 行
+- 第 195-235 行
+
+之所以第一阶段就把第 195-235 行一起带上，是因为 `printToolCall()` 会直接依赖 `getToolIcon()` 和 `getToolSummary()`。
+
+## 手把手实操
+
+### 步骤 1：用第一阶段版本覆盖 `src/ui.ts`
+
+把 `$TARGET_REPO/src/ui.ts` 整个替换成下面这份阶段版代码。
+
+#### 当前阶段版 `src/ui.ts` 完整代码
+
+````ts
 import chalk from "chalk";
 
 export function printWelcome() {
@@ -116,82 +147,6 @@ export function printInfo(msg: string) {
   // 信息提示和错误/正文区分开，统一使用 cyan。
   console.log(chalk.cyan(`\n  ℹ ${msg}`));
 }
-
-// ─── API 调用中的转圈动画 ──────────────────────────────────
-
-// 终端转圈动画使用一组 braille 字符帧。
-const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-
-// 用模块级变量保存 spinner 状态，这样任何调用方都能复用同一个动画。
-let spinnerTimer: ReturnType<typeof setInterval> | null = null;
-let spinnerFrame = 0;
-
-export function startSpinner(label = "Thinking") {
-  // 已经有 spinner 在跑时，不要重复启动第二个。
-  if (spinnerTimer) return;
-  spinnerFrame = 0;
-  process.stdout.write(chalk.gray(`\n  ${SPINNER_FRAMES[0]} ${label}...`));
-  spinnerTimer = setInterval(() => {
-    spinnerFrame = (spinnerFrame + 1) % SPINNER_FRAMES.length;
-    // 使用回车符回到行首并重写这一行，形成动画效果。
-    process.stdout.write(`\r${chalk.gray(`  ${SPINNER_FRAMES[spinnerFrame]} ${label}...`)}`);
-  }, 80);
-}
-
-export function stopSpinner() {
-  if (spinnerTimer) {
-    clearInterval(spinnerTimer);
-    spinnerTimer = null;
-    // `\x1b[K` 会清掉当前行从光标到结尾的内容。
-    process.stdout.write("\r\x1b[K");
-  }
-}
-
-// ─── 计划审批阶段的终端展示 ─────────────────────────────────
-
-export function printPlanForApproval(planContent: string) {
-  // 批准计划前，先把 plan 文件主体打印给用户看。
-  console.log(chalk.cyan("\n  ━━━ Plan for Approval ━━━"));
-  const lines = planContent.split("\n");
-  const maxLines = 60;
-  const display = lines.slice(0, maxLines);
-  for (const line of display) {
-    console.log(chalk.white("  " + line));
-  }
-  // 计划太长时只显示前 60 行，剩余内容给出计数提示。
-  if (lines.length > maxLines) {
-    console.log(chalk.gray(`  ... (${lines.length - maxLines} more lines)`));
-  }
-  console.log(chalk.cyan("  ━━━━━━━━━━━━━━━━━━━━━━━━\n"));
-}
-
-export function printPlanApprovalOptions() {
-  // 四种选项分别对应不同的上下文清理/权限模式。
-  console.log(chalk.yellow("  Choose an option:"));
-  console.log(chalk.white("    1) Yes, clear context and execute") + chalk.gray(" — fresh start with auto-accept edits"));
-  console.log(chalk.white("    2) Yes, and execute") + chalk.gray(" — keep context, auto-accept edits"));
-  console.log(chalk.white("    3) Yes, manually approve edits") + chalk.gray(" — keep context, confirm each edit"));
-  console.log(chalk.white("    4) No, keep planning") + chalk.gray(" — provide feedback to revise"));
-}
-
-// ─── 子代理起止提示 ─────────────────────────────────────────
-
-export function printSubAgentStart(type: string, description: string) {
-  // 子代理开始执行时，在主终端打一条明显的“分支任务开始”提示。
-  console.log(
-    chalk.magenta(`\n  ┌─ Sub-agent [${type}]: ${description}`)
-  );
-}
-
-export function printSubAgentEnd(type: string, description: string) {
-  // 结束时闭合对应提示，便于视觉上成对出现。
-  console.log(
-    chalk.magenta(`  └─ Sub-agent [${type}] completed`)
-  );
-}
-
-// ─── 工具图标与摘要生成 ─────────────────────────────────────
-
 function getToolIcon(name: string): string {
   // 不同工具对应不同图标，让终端输出更易扫读。
   const icons: Record<string, string> = {
@@ -233,3 +188,42 @@ function getToolSummary(name: string, input: Record<string, any>): string {
       return "";
   }
 }
+````
+
+### 步骤 2：先编译
+
+```bash
+cd "$TARGET_REPO"
+npm run build
+```
+
+### 步骤 3：跑一段基础终端输出测试
+
+```bash
+cd "$TARGET_REPO"
+node --input-type=module <<'EOF'
+import { printWelcome, printUserPrompt, printToolCall, printToolResult, printError, printInfo, printCost, printRetry } from "./dist/ui.js";
+
+printWelcome();
+printUserPrompt();
+process.stdout.write("demo input\n");
+printToolCall("read_file", { file_path: "src/app.ts" });
+printToolResult("read_file", "line 1\nline 2");
+printCost(1200, 300);
+printRetry(1, 3, "network hiccup");
+printInfo("basic ui stage ok");
+printError("demo error");
+EOF
+```
+
+## 现在你应该看到什么
+
+1. `npm run build` 可以通过。
+2. 终端里会看到欢迎语、绿色的 `> ` 提示符、以及一条 `read_file src/app.ts` 的工具摘要。
+3. 你还会看到 token cost、retry 信息、cyan 的 info 和红色的 error。
+
+## 本小节的“手把手测试流程”
+
+1. 先执行“步骤 1”，覆盖第一阶段 `src/ui.ts`。
+2. 再执行“步骤 2”的 `npm run build`。
+3. 最后执行“步骤 3”的脚本，直接在终端里观察基础输出效果。

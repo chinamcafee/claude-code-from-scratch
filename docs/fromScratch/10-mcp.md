@@ -1,3 +1,47 @@
+# 第 10 章：接入 `mcp.ts`
+
+这一章把外部 MCP server 接进来。
+
+重点是：先把“连接与桥接”打通，不急着和 Agent 整合。Agent 整合在下一章。
+
+## 本章目标
+
+本章结束后，你会得到：
+
+1. 一个和参考仓库完全一致的 `src/mcp.ts`。
+2. 通过 stdio 启动 MCP server 的能力。
+3. 发现 MCP tools 并转成普通 tool definition 的能力。
+4. 调用 MCP tool 的能力。
+
+## 本章新增的正式源码
+
+- `src/mcp.ts`（295 行）
+- 源码基准：`$REFERENCE_REPO/src/mcp.ts`
+
+## 步骤 1：创建文件
+
+### 先动手
+
+```bash
+cd "$TARGET_REPO"
+touch src/mcp.ts
+```
+
+### 再理解
+
+老规矩，先放位置。
+
+## 步骤 2：复制正式源码并校验
+
+### 先动手
+
+把 `$REFERENCE_REPO/src/mcp.ts` 的 295 行完整复制到 `$TARGET_REPO/src/mcp.ts`。
+
+直接照抄下面这份完整代码：
+
+#### `src/mcp.ts` 完整代码
+
+````ts
 /**
  * 这个模块实现一个最小版 MCP 客户端。
  * 它通过 stdio 启动外部 MCP server，使用原始 JSON-RPC 协议与之通信，
@@ -293,3 +337,123 @@ export class McpManager {
     return config && typeof config === "object" && typeof config.command === "string";
   }
 }
+````
+
+然后执行：
+
+```bash
+diff -u "$REFERENCE_REPO/src/mcp.ts" "$TARGET_REPO/src/mcp.ts"
+```
+
+### 再理解
+
+`mcp.ts` 的边界也非常清楚：
+
+1. 读配置。
+2. 连服务。
+3. 拉工具列表。
+4. 转发调用。
+
+它不负责 Agent loop，不负责权限，不负责 UI。
+
+## 步骤 3：准备一个最小 `.mcp.json`
+
+### 先动手
+
+```bash
+cd "$TARGET_REPO"
+cat > .mcp.json <<EOF
+{
+  "demo": {
+    "command": "node",
+    "args": ["$REFERENCE_REPO/test/mcp-server.cjs"]
+  }
+}
+EOF
+```
+
+### 再理解
+
+这里直接复用参考仓库里现成的测试 MCP server：
+
+- `echo`
+- `add`
+- `timestamp`
+
+这样你不用先自己再写一个 server。
+
+## 步骤 4：构建
+
+### 先动手
+
+```bash
+cd "$TARGET_REPO"
+npm run build
+```
+
+### 再理解
+
+这一章编译通过后，说明你已经具备“连接外部工具生态”的最低能力了。
+
+## 步骤 5：直接测试 MCP 管理器
+
+### 先动手
+
+```bash
+cd "$TARGET_REPO"
+node --input-type=module <<'EOF'
+import { McpManager } from "./dist/mcp.js";
+
+const mcp = new McpManager();
+await mcp.loadAndConnect();
+
+console.log(mcp.getToolDefinitions());
+console.log(await mcp.callTool("mcp__demo__echo", { text: "hello-mcp" }));
+console.log(await mcp.callTool("mcp__demo__add", { a: 2, b: 3 }));
+
+await mcp.disconnectAll();
+EOF
+```
+
+### 再理解
+
+你现在验证的是：
+
+1. 配置能读到。
+2. 进程能拉起来。
+3. 工具列表能发现。
+4. 工具调用能成功。
+5. `mcp__server__tool` 这种前缀命名是通的。
+
+## 本章原理解释
+
+MCP 集成的关键不是“多复杂”，而是“命名和边界够清楚”。
+
+所以这份实现只做最小的一层桥接：
+
+1. JSON-RPC over stdio。
+2. `mcp__server__tool` 命名隔离。
+3. 每个 server 独立连接，失败互不影响。
+
+## 手把手测试流程
+
+```bash
+cd "$TARGET_REPO"
+diff -u "$REFERENCE_REPO/src/mcp.ts" "$TARGET_REPO/src/mcp.ts"
+npm run build
+node --input-type=module <<'EOF'
+import { McpManager } from "./dist/mcp.js";
+const mcp = new McpManager();
+await mcp.loadAndConnect();
+console.log(mcp.isMcpTool("mcp__demo__echo"));
+await mcp.disconnectAll();
+EOF
+```
+
+预期输出：
+
+```text
+true
+```
+
+下一章装配核心 Agent：[11-agent.md](./11-agent.md)

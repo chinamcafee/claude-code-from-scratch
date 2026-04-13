@@ -1,3 +1,35 @@
+# 第 6-3 节：补齐权限系统，完成最终版 `src/tools.ts`
+
+这一小节会把 `src/tools.ts` 从“可执行阶段版”升级到最终版。
+
+本小节新增的核心能力只有一类：权限和安全。
+
+包括：
+
+1. 危险命令检测。
+2. 用户级 / 项目级 allow / deny 规则。
+3. `checkPermission()` 和 `needsConfirmation()`。
+4. Plan Mode 的只读约束。
+
+## 本小节目标
+
+本小节结束后，你应该拿到和参考仓库完全一致的 `src/tools.ts`。
+
+## 这一步的源码基准
+
+这一小节直接使用参考仓库的最终版完整文件：
+
+- `$REFERENCE_REPO/src/tools.ts`（925 行）
+
+## 手把手实操
+
+### 步骤 1：用最终版覆盖 `src/tools.ts`
+
+把 `$TARGET_REPO/src/tools.ts` 整个替换成下面这份最终代码。
+
+#### 最终版 `src/tools.ts` 完整代码
+
+````ts
 import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, statSync } from "fs";
 import { execSync, execFileSync } from "child_process";
 import { glob } from "glob";
@@ -923,3 +955,53 @@ export async function executeTool(
 export function resetPermissionCache(): void {
   cachedRules = null;
 }
+````
+
+### 步骤 2：确认和参考仓库零差异
+
+````bash
+cd "$TARGET_REPO"
+diff -u "$REFERENCE_REPO/src/tools.ts" "$TARGET_REPO/src/tools.ts"
+````
+
+### 步骤 3：重新编译
+
+````bash
+cd "$TARGET_REPO"
+npm run build
+````
+
+### 步骤 4：测试权限系统
+
+````bash
+cd "$TARGET_REPO"
+node --input-type=module <<'EOF'
+import { checkPermission, getDeferredToolNames } from "./dist/tools.js";
+
+console.log(getDeferredToolNames().includes("enter_plan_mode"));
+console.log(checkPermission("run_shell", { command: "git push" }, "default"));
+console.log(checkPermission("run_shell", { command: "rm -rf tmp" }, "default"));
+console.log(checkPermission("write_file", { file_path: "sandbox/new.txt" }, "default"));
+console.log(checkPermission("read_file", { file_path: "sandbox/demo.txt" }, "default"));
+EOF
+````
+
+## 本小节的“手把手测试流程”
+
+````bash
+cd "$TARGET_REPO"
+diff -u "$REFERENCE_REPO/src/tools.ts" "$TARGET_REPO/src/tools.ts"
+npm run build
+node --input-type=module <<'EOF'
+import { checkPermission } from "./dist/tools.js";
+console.log(checkPermission("run_shell", { command: "git push" }, "default").action);
+EOF
+````
+
+预期输出：
+
+````text
+confirm
+````
+
+到这里，工具系统章节完成。下一章进入子代理配置层：[07-subagent.md](./07-subagent.md)

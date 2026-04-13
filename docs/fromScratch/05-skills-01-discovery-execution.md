@@ -1,3 +1,31 @@
+# 第 5-1 节：先搭好技能发现、解析和执行结果整理
+
+这一小节结束后，你拿到的不是最终版 `src/skills.ts`，而是一个可编译、可测试的阶段版。
+
+这个阶段版先把技能系统最核心的三部分接上：扫描目录、解析 `SKILL.md` frontmatter、以及把技能模板展开成最终 prompt。
+
+## 本小节目标
+
+1. 导出 `discoverSkills()`、`getSkillByName()`、`resolveSkillPrompt()`、`executeSkill()`。
+2. 能发现项目级技能目录。
+3. 能把 `$ARGUMENTS` 和 `${CLAUDE_SKILL_DIR}` 替换进 prompt 模板。
+4. 成功编译当前工程。
+
+## 这份阶段版源码来自哪里
+
+这一小节的阶段版 `src/skills.ts` 完全由参考文件中的这段原始源码组成：
+
+- 第 1-165 行
+
+## 手把手实操
+
+### 步骤 1：用第一阶段版本覆盖 `src/skills.ts`
+
+把 `$TARGET_REPO/src/skills.ts` 整个替换成下面这份阶段版代码。
+
+#### 当前阶段版 `src/skills.ts` 完整代码
+
+````ts
 // 这个模块实现项目里的“技能系统”：
 // 1. 从用户目录和项目目录扫描 `.claude/skills/*/SKILL.md`。
 // 2. 解析 frontmatter，得到技能的名字、描述、工具限制、执行上下文。
@@ -163,45 +191,62 @@ export function executeSkill(
     context: skill.context,
   };
 }
+````
 
-// ─── 生成 system prompt 中的“技能说明”小节 ──────────────────
+### 步骤 2：准备一个最小测试技能
 
-export function buildSkillDescriptions(): string {
-  const skills = discoverSkills();
-  if (skills.length === 0) return "";
+```bash
+cd "$TARGET_REPO"
+mkdir -p .claude/skills/explain-error
+cat > .claude/skills/explain-error/SKILL.md <<'EOF'
+---
+name: explain-error
+description: explain an error message
+context: inline
+allowed-tools: read_file,grep_search
+---
+Please explain this error: $ARGUMENTS
 
-  const lines = ["# Available Skills", ""];
-  // 可手动调用和只能自动调用的技能分开展示，避免混淆。
-  const invocable = skills.filter((s) => s.userInvocable);
-  const autoOnly = skills.filter((s) => !s.userInvocable);
+Skill dir is ${CLAUDE_SKILL_DIR}.
+EOF
+```
 
-  if (invocable.length > 0) {
-    lines.push("User-invocable skills (user types /<name> to invoke):");
-    for (const s of invocable) {
-      lines.push(`- **/${s.name}**: ${s.description}`);
-      // `whenToUse` 是给模型看的选择提示，也保留到说明里。
-      if (s.whenToUse) lines.push(`  When to use: ${s.whenToUse}`);
-    }
-    lines.push("");
-  }
+### 步骤 3：先编译
 
-  if (autoOnly.length > 0) {
-    lines.push("Auto-invocable skills (use the skill tool when appropriate):");
-    for (const s of autoOnly) {
-      lines.push(`- **${s.name}**: ${s.description}`);
-      if (s.whenToUse) lines.push(`  When to use: ${s.whenToUse}`);
-    }
-    lines.push("");
-  }
+```bash
+cd "$TARGET_REPO"
+npm run build
+```
 
-  // 最后一行明确告诉模型：程序化调用要走 `skill` 工具，而不是直接复述 prompt。
-  lines.push(
-    "To invoke a skill programmatically, use the `skill` tool with the skill name and optional arguments."
-  );
-  return lines.join("\n");
+### 步骤 4：测试技能发现和模板展开
+
+```bash
+cd "$TARGET_REPO"
+node --input-type=module <<'EOF'
+import { discoverSkills, getSkillByName, resolveSkillPrompt, executeSkill } from "./dist/skills.js";
+
+const skills = discoverSkills();
+console.log("skills:", skills.map((s) => s.name));
+const skill = getSkillByName("explain-error");
+console.log("found:", !!skill);
+if (skill) {
+  console.log(resolveSkillPrompt(skill, "TS2304"));
+  console.log(executeSkill("explain-error", "TS2304"));
 }
+EOF
+```
 
-// 测试或热重载场景下可清空缓存。
-export function resetSkillCache(): void {
-  cachedSkills = null;
-}
+## 现在你应该看到什么
+
+1. `npm run build` 可以通过。
+2. `skills:` 列表里会出现 `explain-error`。
+3. `found:` 应该是 `true`。
+4. 展开后的 prompt 文本里会出现 `TS2304`，并把 `${CLAUDE_SKILL_DIR}` 替换成真实目录。
+5. `executeSkill(...)` 的输出对象里会包含 `allowedTools` 和 `context`。
+
+## 本小节的“手把手测试流程”
+
+1. 先执行“步骤 1”，把第一阶段 `src/skills.ts` 写进去。
+2. 再执行“步骤 2”，准备一个真正可被扫描到的 `SKILL.md`。
+3. 然后执行“步骤 3”的 `npm run build`。
+4. 最后执行“步骤 4”的脚本，确认技能发现、模板展开和执行结果整理都已可用。

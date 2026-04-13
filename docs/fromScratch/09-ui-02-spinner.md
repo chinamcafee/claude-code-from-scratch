@@ -1,3 +1,34 @@
+# 第 9-2 节：补上 spinner 动画
+
+这一小节仍然不是最终版 `src/ui.ts`。
+
+你会在上一节基础上继续扩展，让这个模块多出一套可复用的 spinner 动画接口。
+
+## 本小节目标
+
+1. 导出 `startSpinner()` 和 `stopSpinner()`。
+2. 继续保留上一节全部基础打印函数。
+3. 能在终端里看到启动、刷新、停止 spinner 的效果。
+4. 成功编译当前工程。
+
+## 这份阶段版源码来自哪里
+
+这一小节的阶段版 `src/ui.ts` 完全由参考文件中的这些原始片段拼成：
+
+- 第 1-148 行
+- 第 195-235 行
+
+这里继续保留第 195-235 行的工具摘要辅助函数，原因和上一节一样：`printToolCall()` 仍然依赖它们。
+
+## 手把手实操
+
+### 步骤 1：用第二阶段版本覆盖 `src/ui.ts`
+
+把上一节的阶段版 `src/ui.ts` 整个替换成下面这份第二阶段代码。
+
+#### 当前阶段版 `src/ui.ts` 完整代码
+
+````ts
 import chalk from "chalk";
 
 export function printWelcome() {
@@ -146,52 +177,6 @@ export function stopSpinner() {
     process.stdout.write("\r\x1b[K");
   }
 }
-
-// ─── 计划审批阶段的终端展示 ─────────────────────────────────
-
-export function printPlanForApproval(planContent: string) {
-  // 批准计划前，先把 plan 文件主体打印给用户看。
-  console.log(chalk.cyan("\n  ━━━ Plan for Approval ━━━"));
-  const lines = planContent.split("\n");
-  const maxLines = 60;
-  const display = lines.slice(0, maxLines);
-  for (const line of display) {
-    console.log(chalk.white("  " + line));
-  }
-  // 计划太长时只显示前 60 行，剩余内容给出计数提示。
-  if (lines.length > maxLines) {
-    console.log(chalk.gray(`  ... (${lines.length - maxLines} more lines)`));
-  }
-  console.log(chalk.cyan("  ━━━━━━━━━━━━━━━━━━━━━━━━\n"));
-}
-
-export function printPlanApprovalOptions() {
-  // 四种选项分别对应不同的上下文清理/权限模式。
-  console.log(chalk.yellow("  Choose an option:"));
-  console.log(chalk.white("    1) Yes, clear context and execute") + chalk.gray(" — fresh start with auto-accept edits"));
-  console.log(chalk.white("    2) Yes, and execute") + chalk.gray(" — keep context, auto-accept edits"));
-  console.log(chalk.white("    3) Yes, manually approve edits") + chalk.gray(" — keep context, confirm each edit"));
-  console.log(chalk.white("    4) No, keep planning") + chalk.gray(" — provide feedback to revise"));
-}
-
-// ─── 子代理起止提示 ─────────────────────────────────────────
-
-export function printSubAgentStart(type: string, description: string) {
-  // 子代理开始执行时，在主终端打一条明显的“分支任务开始”提示。
-  console.log(
-    chalk.magenta(`\n  ┌─ Sub-agent [${type}]: ${description}`)
-  );
-}
-
-export function printSubAgentEnd(type: string, description: string) {
-  // 结束时闭合对应提示，便于视觉上成对出现。
-  console.log(
-    chalk.magenta(`  └─ Sub-agent [${type}] completed`)
-  );
-}
-
-// ─── 工具图标与摘要生成 ─────────────────────────────────────
-
 function getToolIcon(name: string): string {
   // 不同工具对应不同图标，让终端输出更易扫读。
   const icons: Record<string, string> = {
@@ -233,3 +218,40 @@ function getToolSummary(name: string, input: Record<string, any>): string {
       return "";
   }
 }
+````
+
+### 步骤 2：先编译
+
+```bash
+cd "$TARGET_REPO"
+npm run build
+```
+
+### 步骤 3：测试 spinner 动画
+
+```bash
+cd "$TARGET_REPO"
+node --input-type=module <<'EOF'
+import { startSpinner, stopSpinner, printInfo } from "./dist/ui.js";
+
+startSpinner("Loading test stage");
+setTimeout(() => {
+  stopSpinner();
+  printInfo("spinner stopped");
+}, 800);
+
+setTimeout(() => process.exit(0), 1100);
+EOF
+```
+
+## 现在你应该看到什么
+
+1. `npm run build` 可以通过。
+2. 终端会先出现一段短暂的 spinner 动画。
+3. 动画停止后，会打印 `spinner stopped`。
+
+## 本小节的“手把手测试流程”
+
+1. 先执行“步骤 1”，把 `src/ui.ts` 升级到第二阶段。
+2. 再执行“步骤 2”的 `npm run build`。
+3. 最后执行“步骤 3”的脚本，确认 spinner 可以启动并停止。

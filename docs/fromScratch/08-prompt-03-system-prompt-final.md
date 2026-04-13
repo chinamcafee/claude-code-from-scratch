@@ -1,3 +1,31 @@
+# 第 8-3 节：接上 system prompt 模板并收口到最终版 `prompt.ts`
+
+这一小节会把 `src/prompt.ts` 收口到最终版。
+
+你会在上一节基础上补上内嵌的 system prompt 模板，以及最终的 `buildSystemPrompt()` 拼装函数。做完以后，这个文件就会和参考仓库完全一致。
+
+## 本小节目标
+
+1. 导出 `buildSystemPrompt()`。
+2. 能把 cwd、日期、平台、shell、Git、CLAUDE.md、memory、skills、agents、deferred tools 一起拼进 system prompt。
+3. 可以用 `diff` 确认当前 `src/prompt.ts` 与参考仓库零差异。
+4. 成功编译当前工程。
+
+## 这份阶段版源码来自哪里
+
+这一小节直接使用参考仓库最终版 `src/prompt.ts`：
+
+- 第 1-261 行
+
+## 手把手实操
+
+### 步骤 1：用最终版覆盖 `src/prompt.ts`
+
+把 `$TARGET_REPO/src/prompt.ts` 整个替换成下面这份最终代码。
+
+#### 最终版 `src/prompt.ts` 完整代码
+
+````ts
 import { readFileSync, existsSync, readdirSync } from "fs";
 import { join, resolve, dirname } from "path";
 import { execSync } from "child_process";
@@ -259,3 +287,45 @@ export function buildSystemPrompt(): string {
     .split("{{agents}}").join(agentSection)
     .split("{{deferred_tools}}").join(deferredSection);
 }
+````
+
+### 步骤 2：确认和参考仓库零差异
+
+```bash
+diff -u "$REFERENCE_REPO/src/prompt.ts" "$TARGET_REPO/src/prompt.ts"
+```
+
+### 步骤 3：重新编译
+
+```bash
+cd "$TARGET_REPO"
+npm run build
+```
+
+### 步骤 4：测试最终 system prompt 组装
+
+```bash
+cd "$TARGET_REPO"
+node --input-type=module <<'EOF'
+import { buildSystemPrompt } from "./dist/prompt.js";
+const prompt = buildSystemPrompt();
+console.log(prompt.includes("You are Mini Claude Code"));
+console.log(prompt.includes("Project root instructions."));
+console.log(prompt.includes("Git branch:"));
+console.log(prompt.slice(0, 1200));
+EOF
+```
+
+## 现在你应该看到什么
+
+1. `diff -u` 没有输出。
+2. `npm run build` 可以通过。
+3. 前两行布尔输出应该至少包含 `true`，说明 system prompt 模板和 `CLAUDE.md` 内容已经被拼进去。
+4. 打印出来的前 1200 个字符里会包含 `You are Mini Claude Code` 开头的 system prompt。
+
+## 本小节的“手把手测试流程”
+
+1. 先执行“步骤 1”覆盖最终版 `src/prompt.ts`。
+2. 再执行“步骤 2”的 `diff -u`。
+3. 然后执行“步骤 3”的 `npm run build`。
+4. 最后执行“步骤 4”的脚本，确认 `buildSystemPrompt()` 已经可以产出完整 system prompt。

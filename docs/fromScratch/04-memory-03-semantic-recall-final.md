@@ -1,3 +1,31 @@
+# 第 4-3 节：接上语义召回、预取和最终版 `memory.ts`
+
+这一小节会把 `src/memory.ts` 收口到最终版。
+
+你会在上一节基础上补上语义召回、预取句柄、记忆注入格式化，以及给 system prompt 用的 `buildMemoryPromptSection()`。做完以后，这个文件就和参考仓库完全一致。
+
+## 本小节目标
+
+1. 导出 `selectRelevantMemories()`、`startMemoryPrefetch()`、`formatMemoriesForInjection()`、`buildMemoryPromptSection()`。
+2. 可以用一个假的 `sideQuery` 跑通记忆筛选。
+3. 可以做 `diff` 确认当前 `src/memory.ts` 和参考仓库零差异。
+4. 成功编译当前工程。
+
+## 这份阶段版源码来自哪里
+
+这一小节直接使用参考仓库最终版 `src/memory.ts`：
+
+- 第 1-439 行
+
+## 手把手实操
+
+### 步骤 1：用最终版覆盖 `src/memory.ts`
+
+把 `$TARGET_REPO/src/memory.ts` 整个替换成下面这份最终代码。
+
+#### 最终版 `src/memory.ts` 完整代码
+
+````ts
 // 这个模块实现一个文件型长期记忆系统：
 // 1. 记忆文件按项目维度存到用户主目录下。
 // 2. 每条记忆都是 markdown + frontmatter。
@@ -437,3 +465,71 @@ The MEMORY.md index is auto-updated when you write to the memory directory — d
 When the user asks you to remember or recall, or when prior context seems relevant.
 ${index ? `\n## Current Memory Index\n${index}` : "\n(No memories saved yet.)"}`;
 }
+````
+
+### 步骤 2：确认和参考仓库零差异
+
+```bash
+diff -u "$REFERENCE_REPO/src/memory.ts" "$TARGET_REPO/src/memory.ts"
+```
+
+### 步骤 3：重新编译
+
+```bash
+cd "$TARGET_REPO"
+npm run build
+```
+
+### 步骤 4：测试语义召回、预取和注入格式
+
+```bash
+cd "$TARGET_REPO"
+node --input-type=module <<'EOF'
+import {
+  saveMemory, deleteMemory, selectRelevantMemories, startMemoryPrefetch,
+  formatMemoriesForInjection, buildMemoryPromptSection
+} from "./dist/memory.js";
+
+const keep = saveMemory({
+  name: "Release Checklist",
+  description: "release checklist for deploys",
+  type: "project",
+  content: "Run tests, check env vars, then deploy.",
+});
+const ignore = saveMemory({
+  name: "Coffee Preference",
+  description: "favorite coffee beans",
+  type: "user",
+  content: "Prefers light roast.",
+});
+
+const sideQuery = async () => JSON.stringify({ selected_memories: [keep] });
+const selected = await selectRelevantMemories("deploy checklist", sideQuery, new Set());
+console.log("selected:", selected.map((m) => m.path));
+console.log(formatMemoriesForInjection(selected));
+
+const prefetch = startMemoryPrefetch("deploy checklist", sideQuery, new Set(), 0);
+const prefetched = prefetch ? await prefetch.promise : [];
+console.log("prefetch-count:", prefetched.length);
+console.log(buildMemoryPromptSection().includes("# Memory System"));
+
+console.log("cleanup-keep:", deleteMemory(keep));
+console.log("cleanup-ignore:", deleteMemory(ignore));
+EOF
+```
+
+## 现在你应该看到什么
+
+1. `diff -u` 没有输出。
+2. `npm run build` 可以通过。
+3. `selected:` 里会出现你刚刚保存的那条部署检查记忆文件路径。
+4. 注入文本里会出现 `<system-reminder>` 包裹的记忆内容。
+5. `prefetch-count:` 至少是 `1`。
+6. `buildMemoryPromptSection().includes("# Memory System")` 应该打印 `true`。
+
+## 本小节的“手把手测试流程”
+
+1. 先执行“步骤 1”覆盖最终版 `src/memory.ts`。
+2. 再执行“步骤 2”的 `diff -u`，确认你已经和参考仓库一致。
+3. 然后执行“步骤 3”的 `npm run build`。
+4. 最后执行“步骤 4”的测试脚本，确认语义召回、预取和注入格式都能跑通。

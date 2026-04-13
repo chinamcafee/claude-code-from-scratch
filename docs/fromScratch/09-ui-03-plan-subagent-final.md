@@ -1,3 +1,31 @@
+# 第 9-3 节：补上计划审批和子代理提示，收口到最终版 `ui.ts`
+
+这一小节会把 `src/ui.ts` 收口到最终版。
+
+你会在上一节基础上补上 plan mode 审批展示和子代理起止提示。做完以后，这个文件就和参考仓库完全一致。
+
+## 本小节目标
+
+1. 导出 `printPlanForApproval()`、`printPlanApprovalOptions()`、`printSubAgentStart()`、`printSubAgentEnd()`。
+2. 可以用 `diff` 确认当前 `src/ui.ts` 与参考仓库零差异。
+3. 成功编译当前工程。
+4. 可以完整演示终端输出层的所有主要函数。
+
+## 这份阶段版源码来自哪里
+
+这一小节直接使用参考仓库最终版 `src/ui.ts`：
+
+- 第 1-235 行
+
+## 手把手实操
+
+### 步骤 1：用最终版覆盖 `src/ui.ts`
+
+把 `$TARGET_REPO/src/ui.ts` 整个替换成下面这份最终代码。
+
+#### 最终版 `src/ui.ts` 完整代码
+
+````ts
 import chalk from "chalk";
 
 export function printWelcome() {
@@ -233,3 +261,52 @@ function getToolSummary(name: string, input: Record<string, any>): string {
       return "";
   }
 }
+````
+
+### 步骤 2：确认和参考仓库零差异
+
+```bash
+diff -u "$REFERENCE_REPO/src/ui.ts" "$TARGET_REPO/src/ui.ts"
+```
+
+### 步骤 3：重新编译
+
+```bash
+cd "$TARGET_REPO"
+npm run build
+```
+
+### 步骤 4：完整测试终端输出层
+
+```bash
+cd "$TARGET_REPO"
+node --input-type=module <<'EOF'
+import { printPlanForApproval, printPlanApprovalOptions, printSubAgentStart, printSubAgentEnd, printDivider } from "./dist/ui.js";
+
+printPlanForApproval([
+  "# Demo Plan",
+  "",
+  "1. Read files",
+  "2. Edit code",
+  "3. Run tests",
+].join("\n"));
+printPlanApprovalOptions();
+printSubAgentStart("explore", "scan the repo for api routes");
+printSubAgentEnd("explore", "scan the repo for api routes");
+printDivider();
+EOF
+```
+
+## 现在你应该看到什么
+
+1. `diff -u` 没有输出。
+2. `npm run build` 可以通过。
+3. 终端会打印一个带边框标题的计划审批预览。
+4. 紧接着你会看到 4 条审批选项，以及一对子代理开始 / 结束提示。
+
+## 本小节的“手把手测试流程”
+
+1. 先执行“步骤 1”覆盖最终版 `src/ui.ts`。
+2. 再执行“步骤 2”的 `diff -u`。
+3. 然后执行“步骤 3”的 `npm run build`。
+4. 最后执行“步骤 4”的脚本，确认计划审批和子代理提示都已经接好。

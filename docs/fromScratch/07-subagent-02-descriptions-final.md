@@ -1,3 +1,31 @@
+# 第 7-2 节：补上 agent 类型说明文本并收口到最终版 `subagent.ts`
+
+这一小节会把 `src/subagent.ts` 收口到最终版。
+
+你会在上一节基础上补上 `getAvailableAgentTypes()`、`buildAgentDescriptions()` 和 `resetAgentCache()`，让后面的 prompt 拼装阶段能够直接消费这些描述文本。
+
+## 本小节目标
+
+1. 导出 `getAvailableAgentTypes()`、`buildAgentDescriptions()`、`resetAgentCache()`。
+2. 可以列出内置和自定义 agent 类型。
+3. 可以用 `diff` 确认当前 `src/subagent.ts` 与参考仓库零差异。
+4. 成功编译当前工程。
+
+## 这份阶段版源码来自哪里
+
+这一小节直接使用参考仓库最终版 `src/subagent.ts`：
+
+- 第 1-229 行
+
+## 手把手实操
+
+### 步骤 1：用最终版覆盖 `src/subagent.ts`
+
+把 `$TARGET_REPO/src/subagent.ts` 整个替换成下面这份最终代码。
+
+#### 最终版 `src/subagent.ts` 完整代码
+
+````ts
 // 这个模块负责“子代理”能力：
 // 1. 内置 explore / plan / general 三种 agent 类型。
 // 2. 从 `.claude/agents/*.md` 发现用户自定义 agent。
@@ -227,3 +255,44 @@ export function buildAgentDescriptions(): string {
 export function resetAgentCache(): void {
   cachedCustomAgents = null;
 }
+````
+
+### 步骤 2：确认和参考仓库零差异
+
+```bash
+diff -u "$REFERENCE_REPO/src/subagent.ts" "$TARGET_REPO/src/subagent.ts"
+```
+
+### 步骤 3：重新编译
+
+```bash
+cd "$TARGET_REPO"
+npm run build
+```
+
+### 步骤 4：测试 agent 类型列表和说明文本
+
+```bash
+cd "$TARGET_REPO"
+node --input-type=module <<'EOF'
+import { getAvailableAgentTypes, buildAgentDescriptions, resetAgentCache } from "./dist/subagent.js";
+
+resetAgentCache();
+console.log(getAvailableAgentTypes());
+console.log(buildAgentDescriptions());
+EOF
+```
+
+## 现在你应该看到什么
+
+1. `diff -u` 没有输出。
+2. `npm run build` 可以通过。
+3. `getAvailableAgentTypes()` 的结果里会至少包含 `explore`、`plan`、`general`，以及你在上一节创建的 `reviewer`。
+4. `buildAgentDescriptions()` 的输出里会出现 `# Custom Agent Types` 和 `reviewer` 的描述。
+
+## 本小节的“手把手测试流程”
+
+1. 先执行“步骤 1”覆盖最终版 `src/subagent.ts`。
+2. 再执行“步骤 2”的 `diff -u`。
+3. 然后执行“步骤 3”的 `npm run build`。
+4. 最后执行“步骤 4”的脚本，确认 agent 类型列表和描述文本已完整。

@@ -1,3 +1,33 @@
+# 第 11-3 节：替换成最终版 `src/agent.ts`，接上完整 runtime
+
+这一小节会把 `src/agent.ts` 替换成参考仓库里的最终版完整文件。
+
+从这一小节结束开始，你的 Agent 才真正具备：
+
+1. 完整的 `chatAnthropic()` / `chatOpenAI()`。
+2. 工具桥接。
+3. Plan Mode 完整审批流。
+4. Skill / Sub-agent。
+5. 上下文压缩流水线。
+6. MCP 和记忆预取接入。
+
+## 本小节目标
+
+本小节结束后，你应该拿到和参考仓库完全一致的 `src/agent.ts`。
+
+## 这一步的源码基准
+
+- `$REFERENCE_REPO/src/agent.ts`（1615 行）
+
+## 手把手实操
+
+### 步骤 1：用最终版覆盖 `src/agent.ts`
+
+把 `$TARGET_REPO/src/agent.ts` 整个替换成下面这份最终代码。
+
+#### 最终版 `src/agent.ts` 完整代码
+
+````ts
 import Anthropic from "@anthropic-ai/sdk";
 import OpenAI from "openai";
 import chalk from "chalk";
@@ -1613,3 +1643,104 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
     });
   }
 }
+````
+
+### 步骤 2：确认和参考仓库零差异
+
+````bash
+cd "$TARGET_REPO"
+diff -u "$REFERENCE_REPO/src/agent.ts" "$TARGET_REPO/src/agent.ts"
+````
+
+### 步骤 3：重新编译
+
+````bash
+cd "$TARGET_REPO"
+npm run build
+````
+
+### 步骤 4：先做一个不访问模型的本地 smoke test
+
+````bash
+cd "$TARGET_REPO"
+node --input-type=module <<'EOF'
+import { Agent } from "./dist/agent.js";
+
+const agent = new Agent({
+  permissionMode: "default",
+  model: "claude-opus-4-6",
+  apiKey: "dummy-key"
+});
+
+console.log(agent.getPermissionMode());
+console.log(agent.togglePlanMode());
+console.log(agent.togglePlanMode());
+console.log(agent.getTokenUsage());
+EOF
+````
+
+### 步骤 5：可选，做一次真实最小对话
+
+如果你已经配置了真实模型环境变量，可以执行下面任意一组。
+
+Anthropic 方式：
+
+````bash
+cd "$TARGET_REPO"
+export ANTHROPIC_API_KEY=你的真实密钥
+export MINI_CLAUDE_MODEL=claude-sonnet-4-6
+node --input-type=module <<'EOF'
+import { Agent } from "./dist/agent.js";
+
+const agent = new Agent({
+  apiKey: process.env.ANTHROPIC_API_KEY,
+  model: process.env.MINI_CLAUDE_MODEL || "claude-sonnet-4-6"
+});
+
+const result = await agent.runOnce("Reply with exactly: AGENT_OK");
+console.log(result.text.trim());
+console.log(result.tokens);
+EOF
+````
+
+OpenAI-compatible 方式：
+
+````bash
+cd "$TARGET_REPO"
+export OPENAI_API_KEY=你的真实密钥
+export OPENAI_BASE_URL=你的兼容接口地址
+node --input-type=module <<'EOF'
+import { Agent } from "./dist/agent.js";
+
+const agent = new Agent({
+  apiKey: process.env.OPENAI_API_KEY,
+  apiBase: process.env.OPENAI_BASE_URL,
+  model: "gpt-4o-mini"
+});
+
+const result = await agent.runOnce("Reply with exactly: AGENT_OK");
+console.log(result.text.trim());
+console.log(result.tokens);
+EOF
+````
+
+## 本小节的“手把手测试流程”
+
+````bash
+cd "$TARGET_REPO"
+diff -u "$REFERENCE_REPO/src/agent.ts" "$TARGET_REPO/src/agent.ts"
+npm run build
+node --input-type=module <<'EOF'
+import { Agent } from "./dist/agent.js";
+const agent = new Agent({ apiKey: "dummy-key" });
+console.log(agent.getPermissionMode());
+EOF
+````
+
+预期输出：
+
+````text
+default
+````
+
+到这里，Agent 内核章节完成。下一章把占位 CLI 换成正式入口：[12-cli.md](./12-cli.md)

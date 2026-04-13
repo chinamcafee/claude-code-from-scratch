@@ -1,3 +1,31 @@
+# 第 5-2 节：补上技能说明文本并收口到最终版 `skills.ts`
+
+这一小节会把 `src/skills.ts` 收口到最终版。
+
+你会在上一节的基础上补上 `buildSkillDescriptions()` 和 `resetSkillCache()`，让这个文件既能服务 CLI，也能服务后面的 system prompt 拼装逻辑。
+
+## 本小节目标
+
+1. 导出 `buildSkillDescriptions()` 和 `resetSkillCache()`。
+2. 可以生成“用户可手动调用”和“仅自动调用”的技能说明文本。
+3. 可以用 `diff` 确认当前 `src/skills.ts` 与参考仓库零差异。
+4. 成功编译当前工程。
+
+## 这份阶段版源码来自哪里
+
+这一小节直接使用参考仓库最终版 `src/skills.ts`：
+
+- 第 1-207 行
+
+## 手把手实操
+
+### 步骤 1：用最终版覆盖 `src/skills.ts`
+
+把 `$TARGET_REPO/src/skills.ts` 整个替换成下面这份最终代码。
+
+#### 最终版 `src/skills.ts` 完整代码
+
+````ts
 // 这个模块实现项目里的“技能系统”：
 // 1. 从用户目录和项目目录扫描 `.claude/skills/*/SKILL.md`。
 // 2. 解析 frontmatter，得到技能的名字、描述、工具限制、执行上下文。
@@ -205,3 +233,61 @@ export function buildSkillDescriptions(): string {
 export function resetSkillCache(): void {
   cachedSkills = null;
 }
+````
+
+### 步骤 2：确认和参考仓库零差异
+
+```bash
+diff -u "$REFERENCE_REPO/src/skills.ts" "$TARGET_REPO/src/skills.ts"
+```
+
+### 步骤 3：再准备一个只允许自动调用的技能
+
+```bash
+cd "$TARGET_REPO"
+mkdir -p .claude/skills/auto-review
+cat > .claude/skills/auto-review/SKILL.md <<'EOF'
+---
+name: auto-review
+description: review a patch automatically
+user-invocable: false
+when-to-use: When code review is requested implicitly.
+---
+Review this patch carefully: $ARGUMENTS
+EOF
+```
+
+### 步骤 4：重新编译
+
+```bash
+cd "$TARGET_REPO"
+npm run build
+```
+
+### 步骤 5：测试技能说明文本
+
+```bash
+cd "$TARGET_REPO"
+node --input-type=module <<'EOF'
+import { buildSkillDescriptions, resetSkillCache } from "./dist/skills.js";
+
+resetSkillCache();
+console.log(buildSkillDescriptions());
+EOF
+```
+
+## 现在你应该看到什么
+
+1. `diff -u` 没有输出。
+2. `npm run build` 可以通过。
+3. 输出文本里会出现 `# Available Skills`。
+4. 你会同时看到 `User-invocable skills` 和 `Auto-invocable skills` 两个分组。
+5. `/explain-error` 会以带斜杠的形式出现，而 `auto-review` 会出现在自动调用分组里。
+
+## 本小节的“手把手测试流程”
+
+1. 先执行“步骤 1”覆盖最终版 `src/skills.ts`。
+2. 再执行“步骤 2”的 `diff -u`。
+3. 然后执行“步骤 3”准备第二个测试技能。
+4. 接着执行“步骤 4”的 `npm run build`。
+5. 最后执行“步骤 5”的脚本，确认技能说明文本已经完整。

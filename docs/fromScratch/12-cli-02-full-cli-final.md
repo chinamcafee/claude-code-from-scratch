@@ -1,3 +1,31 @@
+# 第 12-2 节：补上内建命令、技能调用并收口到最终版 `cli.ts`
+
+这一小节会把 `src/cli.ts` 收口到最终版。
+
+你会在上一小节的基础上补上完整 REPL 分支逻辑：`/clear /plan /cost /compact /memory /skills`、技能调用分发，以及最终的一比一源码验收。
+
+## 本小节目标
+
+1. 支持完整 REPL 内建命令。
+2. 支持 `/<skill-name>` 的技能调用入口。
+3. 可以用 `diff` 确认当前 `src/cli.ts` 与参考仓库零差异。
+4. 成功编译当前工程。
+
+## 这份阶段版源码来自哪里
+
+这一小节直接使用参考仓库最终版 `src/cli.ts`：
+
+- 第 1-416 行
+
+## 手把手实操
+
+### 步骤 1：用最终版覆盖 `src/cli.ts`
+
+把 `$TARGET_REPO/src/cli.ts` 整个替换成下面这份最终代码。
+
+#### 最终版 `src/cli.ts` 完整代码
+
+````ts
 #!/usr/bin/env node
 
 import * as readline from "readline";
@@ -414,3 +442,40 @@ async function main() {
 
 // CLI 程序入口。
 main();
+````
+
+### 步骤 2：确认和参考仓库零差异
+
+```bash
+diff -u "$REFERENCE_REPO/src/cli.ts" "$TARGET_REPO/src/cli.ts"
+```
+
+### 步骤 3：重新编译
+
+```bash
+cd "$TARGET_REPO"
+npm run build
+```
+
+### 步骤 4：测试完整 CLI 内建命令
+
+```bash
+cd "$TARGET_REPO"
+node dist/cli.js --help
+
+printf "/memory\n/skills\n/clear\n/cost\n/plan\nexit\n" | env ANTHROPIC_API_KEY=dummy node dist/cli.js
+```
+
+## 现在你应该看到什么
+
+1. `diff -u` 没有输出。
+2. `npm run build` 可以通过。
+3. 第二条命令进入 REPL 后，会依次执行 `/memory`、`/skills`、`/clear`、`/cost`、`/plan`，最后读到 `exit` 退出。
+4. 因为这些命令都在真正发起模型请求之前被拦截，所以即使只给了一个 dummy API key，也能完成这组测试。
+
+## 本小节的“手把手测试流程”
+
+1. 先执行“步骤 1”覆盖最终版 `src/cli.ts`。
+2. 再执行“步骤 2”的 `diff -u`。
+3. 然后执行“步骤 3”的 `npm run build`。
+4. 最后执行“步骤 4”的两条命令，确认完整帮助页和 REPL 内建命令都已可用。

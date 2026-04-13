@@ -1,3 +1,42 @@
+# 第 6-2 节：接上本地工具执行器和 `executeTool()`
+
+这一小节会把 `src/tools.ts` 升级到第二阶段：
+
+1. 文件读写改。
+2. 文件搜索。
+3. shell 执行。
+4. `web_fetch`。
+5. `tool_search`。
+6. 最终对外的 `executeTool()` 分发入口。
+
+本小节结束后，`src/tools.ts` 仍然不是最终版，因为权限系统还没接上。
+
+## 本小节目标
+
+本小节结束后，你应该能：
+
+1. 调用 `executeTool()` 跑通本地工具。
+2. 跑通 `web_fetch` 和 `tool_search`。
+3. 成功编译当前工程。
+
+## 这份阶段版源码来自哪里
+
+这一小节的阶段版 `src/tools.ts` 完全由参考文件中的下面两段原始源码拼成：
+
+- `$REFERENCE_REPO/src/tools.ts` 第 1-536 行
+- `$REFERENCE_REPO/src/tools.ts` 第 759-920 行
+
+这样拼出来的原因很简单：它能得到一个“已经可执行，但还没接权限系统”的完整阶段版。
+
+## 手把手实操
+
+### 步骤 1：用第二阶段版本覆盖 `src/tools.ts`
+
+把 `$TARGET_REPO/src/tools.ts` 整个替换成下面这份阶段版代码。
+
+#### 当前阶段版 `src/tools.ts` 完整代码
+
+````ts
 import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, statSync } from "fs";
 import { execSync, execFileSync } from "child_process";
 import { glob } from "glob";
@@ -534,228 +573,6 @@ function runShell(input: { command: string; timeout?: number }): string {
   }
 }
 
-// ─── 危险 shell 命令模式 ────────────────────────────────────
-
-const DANGEROUS_PATTERNS = [
-  // Unix / git 常见高风险命令。
-  /\brm\s/,
-  /\bgit\s+(push|reset|clean|checkout\s+\.)/,
-  /\bsudo\b/,
-  /\bmkfs\b/,
-  /\bdd\s/,
-  />\s*\/dev\//,
-  /\bkill\b/,
-  /\bpkill\b/,
-  /\breboot\b/,
-  /\bshutdown\b/,
-  // Windows 等价高风险命令。
-  /\bdel\s/i,
-  /\brmdir\s/i,
-  /\bformat\s/i,
-  /\btaskkill\s/i,
-  /\bRemove-Item\s/i,
-  /\bStop-Process\s/i,
-];
-
-export function isDangerous(command: string): boolean {
-  // 只要命中任一模式，就要求上层做确认。
-  return DANGEROUS_PATTERNS.some((p) => p.test(command));
-}
-
-// ─── 权限规则：从配置文件加载 allow/deny ─────────────────────
-
-interface ParsedRule {
-  // 工具名，例如 `run_shell` / `write_file`。
-  tool: string;
-  // 可选的值匹配规则，例如路径前缀或完整命令。
-  pattern: string | null;
-}
-
-interface PermissionRules {
-  // 命中 allow 后可直接放行。
-  allow: ParsedRule[];
-  // 命中 deny 后直接拒绝，优先级高于 allow。
-  deny: ParsedRule[];
-}
-
-let cachedRules: PermissionRules | null = null;
-
-function parseRule(rule: string): ParsedRule {
-  // 支持两种格式：
-  // 1. `run_shell`
-  // 2. `write_file(src/*)`
-  const match = rule.match(/^([a-z_]+)\((.+)\)$/);
-  if (match) {
-    return { tool: match[1], pattern: match[2] };
-  }
-  return { tool: rule, pattern: null };
-}
-
-function loadSettings(filePath: string): any {
-  if (!existsSync(filePath)) return null;
-  try {
-    return JSON.parse(readFileSync(filePath, "utf-8"));
-  } catch {
-    return null;
-  }
-}
-
-export function loadPermissionRules(): PermissionRules {
-  // 规则做缓存，避免每次工具调用都重复读磁盘。
-  if (cachedRules) return cachedRules;
-
-  const allow: ParsedRule[] = [];
-  const deny: ParsedRule[] = [];
-
-  // 先读用户级，再读项目级；二者都会累积到同一个规则集。
-  const userSettings = loadSettings(join(homedir(), ".claude", "settings.json"));
-  const projectSettings = loadSettings(join(process.cwd(), ".claude", "settings.json"));
-
-  for (const settings of [userSettings, projectSettings]) {
-    if (!settings?.permissions) continue;
-    if (Array.isArray(settings.permissions.allow)) {
-      for (const r of settings.permissions.allow) allow.push(parseRule(r));
-    }
-    if (Array.isArray(settings.permissions.deny)) {
-      for (const r of settings.permissions.deny) deny.push(parseRule(r));
-    }
-  }
-
-  cachedRules = { allow, deny };
-  return cachedRules;
-}
-
-function matchesRule(rule: ParsedRule, toolName: string, input: Record<string, any>): boolean {
-  // 工具名对不上时直接失败。
-  if (rule.tool !== toolName) return false;
-  // 没写 pattern 就表示这个工具的所有调用都命中。
-  if (!rule.pattern) return true;
-
-  // 根据工具类型挑选最关键的输入字段做匹配。
-  let value = "";
-  if (toolName === "run_shell") value = input.command || "";
-  else if (input.file_path) value = input.file_path;
-  else return true;
-
-  const pattern = rule.pattern;
-  // 末尾 `*` 表示“前缀匹配”，适合路径白名单。
-  if (pattern.endsWith("*")) {
-    return value.startsWith(pattern.slice(0, -1));
-  }
-  // 否则就是严格全等。
-  return value === pattern;
-}
-
-function checkPermissionRules(
-  toolName: string,
-  input: Record<string, any>
-): "allow" | "deny" | null {
-  const rules = loadPermissionRules();
-
-  // deny 优先级最高，先检查。
-  for (const rule of rules.deny) {
-    if (matchesRule(rule, toolName, input)) return "deny";
-  }
-  // deny 都没命中时，再检查 allow。
-  for (const rule of rules.allow) {
-    if (matchesRule(rule, toolName, input)) return "allow";
-  }
-  // 没规则命中时回落到内建策略。
-  return null;
-}
-
-// ─── 统一权限检查入口 ────────────────────────────────────────
-// 返回值三态：
-// - allow: 直接执行
-// - deny: 直接阻止
-// - confirm: 需要用户确认
-
-export function checkPermission(
-  toolName: string,
-  input: Record<string, any>,
-  mode: PermissionMode = "default",
-  planFilePath?: string
-): { action: "allow" | "deny" | "confirm"; message?: string } {
-  // `--yolo` / bypass 模式下无条件放行。
-  if (mode === "bypassPermissions") return { action: "allow" };
-
-  // 第一步：配置文件规则优先。
-  const ruleResult = checkPermissionRules(toolName, input);
-  if (ruleResult === "deny") {
-    return { action: "deny", message: `Denied by permission rule for ${toolName}` };
-  }
-  if (ruleResult === "allow") {
-    return { action: "allow" };
-  }
-
-  // 第二步：读工具在任何模式下都自动放行。
-  if (READ_TOOLS.has(toolName)) return { action: "allow" };
-
-  // plan 模式下：
-  // 1. 只允许读工具
-  // 2. 唯一可写文件是 plan 文件本身
-  // 3. shell 一律禁用
-  if (mode === "plan") {
-    if (EDIT_TOOLS.has(toolName)) {
-      const filePath = input.file_path || input.path;
-      if (planFilePath && filePath === planFilePath) {
-        return { action: "allow" };
-      }
-      return { action: "deny", message: `Blocked in plan mode: ${toolName}` };
-    }
-    if (toolName === "run_shell") {
-      return { action: "deny", message: "Shell commands blocked in plan mode" };
-    }
-  }
-
-  // 进入/退出 plan 模式本身必须允许，否则模型永远无法切换模式。
-  if (toolName === "enter_plan_mode" || toolName === "exit_plan_mode") {
-    return { action: "allow" };
-  }
-
-  // `acceptEdits` 自动批准文件编辑，但危险 shell 仍需确认。
-  if (mode === "acceptEdits" && EDIT_TOOLS.has(toolName)) {
-    return { action: "allow" };
-  }
-
-  // 第三步：内建危险模式检测。
-  let needsConfirm = false;
-  let confirmMessage = "";
-
-  if (toolName === "run_shell" && isDangerous(input.command)) {
-    needsConfirm = true;
-    confirmMessage = input.command;
-  } else if (toolName === "write_file" && !existsSync(input.file_path)) {
-    // 创建新文件相对不可逆，默认要求确认。
-    needsConfirm = true;
-    confirmMessage = `write new file: ${input.file_path}`;
-  } else if (toolName === "edit_file" && !existsSync(input.file_path)) {
-    // 编辑不存在文件通常意味着模型路径判断错了，也要求确认。
-    needsConfirm = true;
-    confirmMessage = `edit non-existent file: ${input.file_path}`;
-  }
-
-  if (needsConfirm) {
-    // `dontAsk` 常用于 CI，凡是本来需要确认的操作一律自动拒绝。
-    if (mode === "dontAsk") {
-      return { action: "deny", message: `Auto-denied (dontAsk mode): ${confirmMessage}` };
-    }
-    return { action: "confirm", message: confirmMessage };
-  }
-
-  return { action: "allow" };
-}
-
-// 老接口兼容层：旧代码如果还在调用 `needsConfirmation` 也能正常工作。
-export function needsConfirmation(
-  toolName: string,
-  input: Record<string, any>
-): string | null {
-  const result = checkPermission(toolName, input);
-  if (result.action === "confirm") return result.message || null;
-  return null;
-}
-
 // ─── 长工具输出截断 ─────────────────────────────────────────
 
 const MAX_RESULT_CHARS = 50000;
@@ -918,8 +735,79 @@ export async function executeTool(
   // 所有工具最终都统一走一次结果截断。
   return truncateResult(result);
 }
+````
 
-// 测试辅助：清空权限规则缓存。
-export function resetPermissionCache(): void {
-  cachedRules = null;
-}
+### 步骤 2：先编译
+
+````bash
+cd "$TARGET_REPO"
+npm run build
+````
+
+### 步骤 3：跑一组本地工具测试
+
+````bash
+cd "$TARGET_REPO"
+node --input-type=module <<'EOF'
+import { executeTool } from "./dist/tools.js";
+
+await executeTool("write_file", {
+  file_path: "sandbox/demo.txt",
+  content: "alpha\nbeta\ngamma"
+});
+
+const state = new Map();
+console.log(await executeTool("read_file", { file_path: "sandbox/demo.txt" }, state));
+console.log(await executeTool("edit_file", {
+  file_path: "sandbox/demo.txt",
+  old_string: "beta",
+  new_string: "BETA"
+}, state));
+console.log(await executeTool("list_files", { pattern: "sandbox/**/*.txt" }));
+console.log(await executeTool("grep_search", { pattern: "BETA", path: "sandbox" }));
+console.log(await executeTool("run_shell", { command: "printf 'shell-ok'" }));
+EOF
+````
+
+### 步骤 4：再跑一组 `web_fetch` / `tool_search` 测试
+
+````bash
+cd "$TARGET_REPO"
+node --input-type=module <<'EOF'
+import { executeTool, getDeferredToolNames } from "./dist/tools.js";
+
+console.log(getDeferredToolNames());
+console.log(await executeTool("tool_search", { query: "plan" }));
+console.log(await executeTool("web_fetch", {
+  url: "https://example.com",
+  max_length: 200
+}));
+EOF
+````
+
+## 现在你应该看到什么
+
+这一小节完成后，至少要确认：
+
+1. `executeTool("write_file")`、`read_file`、`edit_file` 已经可用。
+2. `tool_search` 能把 deferred tools 激活出来。
+3. `web_fetch` 能返回网页文本。
+
+## 本小节的“手把手测试流程”
+
+````bash
+cd "$TARGET_REPO"
+npm run build
+node --input-type=module <<'EOF'
+import { executeTool } from "./dist/tools.js";
+console.log(await executeTool("run_shell", { command: "printf 'stage2-ok'" }));
+EOF
+````
+
+预期输出包含：
+
+````text
+stage2-ok
+````
+
+下一小节补上权限系统，完成最终版文件：[06-tools-03-permissions-final.md](./06-tools-03-permissions-final.md)

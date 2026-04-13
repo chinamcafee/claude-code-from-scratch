@@ -1,3 +1,31 @@
+# 第 4-2 节：补上头部扫描、manifest 和新鲜度判断
+
+这一小节仍然不是最终版 `src/memory.ts`。
+
+你会在上一节的基础上继续扩展：让系统先轻量扫描每个记忆文件的头部元数据，再把它们整理成 manifest，同时补上“距今多久”和“是否过期”的提示函数。
+
+## 本小节目标
+
+1. 导出 `scanMemoryHeaders()`、`formatMemoryManifest()`、`memoryAge()`、`memoryFreshnessWarning()`。
+2. 能扫描出记忆文件名、描述、类型和修改时间。
+3. 能把扫描结果压成多行 manifest 文本。
+4. 成功编译当前工程。
+
+## 这份阶段版源码来自哪里
+
+这一小节的阶段版 `src/memory.ts` 完全由参考文件中的这段原始源码组成：
+
+- 第 1-252 行
+
+## 手把手实操
+
+### 步骤 1：用第二阶段版本覆盖 `src/memory.ts`
+
+把上一节的阶段版 `src/memory.ts` 整个替换成下面这份第二阶段代码。
+
+#### 当前阶段版 `src/memory.ts` 完整代码
+
+````ts
 // 这个模块实现一个文件型长期记忆系统：
 // 1. 记忆文件按项目维度存到用户主目录下。
 // 2. 每条记忆都是 markdown + frontmatter。
@@ -250,190 +278,57 @@ export function memoryFreshnessWarning(mtimeMs: number): string {
   // 旧记忆注入前会带上这一段，提醒模型不要把它当实时真相。
   return `This memory is ${days} days old. Memories are point-in-time observations, not live state — claims about code behavior may be outdated. Verify against current code before asserting as fact.`;
 }
+````
 
-// ─── 语义召回：先筛文件，再读取正文 ─────────────────────────
+### 步骤 2：先编译
 
-const SELECT_MEMORIES_PROMPT = `You are selecting memories that will be useful to an AI coding assistant as it processes a user's query. You will be given the user's query and a list of available memory files with their filenames and descriptions.
+```bash
+cd "$TARGET_REPO"
+npm run build
+```
 
-Return a JSON object with a "selected_memories" array of filenames for the memories that will clearly be useful (up to 5). Only include memories that you are certain will be helpful based on their name and description.
-- If you are unsure if a memory will be useful, do not include it.
-- If no memories would clearly be useful, return an empty array.`;
+### 步骤 3：测试头部扫描和 manifest
 
-export interface RelevantMemory {
-  // 记忆文件的绝对路径。
-  path: string;
-  // 真正会注入对话的文本内容。
-  content: string;
-  // 保存时间，用于新鲜度提示。
-  mtimeMs: number;
-  // 注入时前置的一段解释性头部。
-  header: string;
+```bash
+cd "$TARGET_REPO"
+node --input-type=module <<'EOF'
+import { saveMemory, deleteMemory, scanMemoryHeaders, formatMemoryManifest, memoryAge, memoryFreshnessWarning } from "./dist/memory.js";
+
+const a = saveMemory({
+  name: "Build Notes",
+  description: "notes about local build commands",
+  type: "project",
+  content: "Run npm run build before smoke tests.",
+});
+const b = saveMemory({
+  name: "Dashboard Link",
+  description: "points to internal dashboard",
+  type: "reference",
+  content: "https://example.com/dashboard",
+});
+
+const headers = scanMemoryHeaders();
+console.log("headers:", headers.length);
+console.log(formatMemoryManifest(headers));
+if (headers[0]) {
+  console.log("age:", memoryAge(headers[0].mtimeMs));
+  console.log("warning:", memoryFreshnessWarning(headers[0].mtimeMs));
 }
+console.log("cleanup-a:", deleteMemory(a));
+console.log("cleanup-b:", deleteMemory(b));
+EOF
+```
 
-// 用 sideQuery 调当前模型，让模型从 manifest 里选最多 5 条明显相关的记忆。
-export async function selectRelevantMemories(
-  query: string,
-  sideQuery: SideQueryFn,
-  alreadySurfaced: Set<string>,
-  signal?: AbortSignal,
-): Promise<RelevantMemory[]> {
-  const headers = scanMemoryHeaders();
-  if (headers.length === 0) return [];
+## 现在你应该看到什么
 
-  // 已经在当前会话里给过模型看的记忆，不再重复发给 selector。
-  const candidates = headers.filter((h) => !alreadySurfaced.has(h.filePath));
-  if (candidates.length === 0) return [];
+1. `npm run build` 可以通过。
+2. 终端会打印出 `headers:`，数量至少包含你刚刚创建的两条记忆。
+3. manifest 文本里会出现带时间戳的 `project_...md` 和 `reference_...md`。
+4. `memoryAge(...)` 对刚创建的文件通常会返回 `today`。
+5. 两条 `cleanup-*` 都应该是 `true`。
 
-  const manifest = formatMemoryManifest(candidates);
+## 本小节的“手把手测试流程”
 
-  try {
-    // selector 只负责选文件名，不直接读正文，这样 token 成本更可控。
-    const text = await sideQuery(
-      SELECT_MEMORIES_PROMPT,
-      `Query: ${query}\n\nAvailable memories:\n${manifest}`,
-      signal,
-    );
-
-    // 模型偶尔会把 JSON 包在 markdown 代码块里，这里用正则把对象提出来。
-    const jsonMatch = text.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) return [];
-
-    const parsed = JSON.parse(jsonMatch[0]);
-    const selectedFilenames: string[] = parsed.selected_memories || [];
-
-    // 根据文件名映射回 headers，再读取这些记忆的全文。
-    const filenameSet = new Set(selectedFilenames);
-    const selected = candidates.filter((h) => filenameSet.has(h.filename));
-
-    return selected.slice(0, 5).map((h) => {
-      let content = readFileSync(h.filePath, "utf-8");
-      // 单条记忆正文过长时截断到 4KB，防止一条记忆独吞上下文。
-      if (Buffer.byteLength(content) > MAX_MEMORY_BYTES_PER_FILE) {
-        content = content.slice(0, MAX_MEMORY_BYTES_PER_FILE) +
-          "\n\n[... truncated, memory file too large ...]";
-      }
-      const freshness = memoryFreshnessWarning(h.mtimeMs);
-      const headerText = freshness
-        ? `${freshness}\n\nMemory: ${h.filePath}:`
-        : `Memory (saved ${memoryAge(h.mtimeMs)}): ${h.filePath}:`;
-
-      return { path: h.filePath, content, mtimeMs: h.mtimeMs, header: headerText };
-    });
-  } catch (err: any) {
-    // 记忆召回失败绝不能阻塞主对话；只打印诊断信息后返回空数组。
-    if (signal?.aborted) return [];
-    console.error(`[memory] semantic recall failed: ${err.message}`);
-    return [];
-  }
-}
-
-// ─── 预取句柄：让记忆召回异步进行，不阻塞首轮模型响应 ──────────
-
-export interface MemoryPrefetch {
-  // 实际执行中的 Promise。
-  promise: Promise<RelevantMemory[]>;
-  // 是否已经完成，用于主循环轮询。
-  settled: boolean;
-  // 是否已经把结果消耗并注入过消息历史。
-  consumed: boolean;
-}
-
-// 判断用户输入是否“值得触发一次记忆召回”。
-// 规则比较保守：要么包含至少两个 CJK 字符，要么至少是多词输入。
-function isQuerySubstantial(query: string): boolean {
-  const trimmed = query.trim();
-  if (trimmed.length === 0) return false;
-
-  // 中文/日文/韩文经常没有空格，所以单独按字符集判断。
-  const cjkRegex = /[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]/g;
-  const cjkMatches = trimmed.match(cjkRegex);
-  if (cjkMatches && cjkMatches.length >= 2) return true;
-
-  // 非 CJK 场景退回“是否至少有空白分词”的启发式。
-  if (/\s/.test(trimmed)) return true;
-
-  return false;
-}
-
-export function startMemoryPrefetch(
-  query: string,
-  sideQuery: SideQueryFn,
-  alreadySurfaced: Set<string>,
-  sessionMemoryBytes: number,
-  signal?: AbortSignal,
-): MemoryPrefetch | null {
-  // 输入太短/太含糊时不值得额外调用一次 selector 模型。
-  if (!isQuerySubstantial(query)) return null;
-
-  // 会话内累计注入的记忆已经太多时，直接停掉后续召回。
-  if (sessionMemoryBytes >= MAX_SESSION_MEMORY_BYTES) return null;
-
-  // 没有任何记忆文件时也没必要预取。
-  const dir = getMemoryDir();
-  const hasMemories = readdirSync(dir).some(
-    (f) => f.endsWith(".md") && f !== "MEMORY.md"
-  );
-  if (!hasMemories) return null;
-
-  // 返回一个可轮询状态的句柄，而不是直接 await，让主对话可以先跑起来。
-  const handle: MemoryPrefetch = {
-    promise: selectRelevantMemories(query, sideQuery, alreadySurfaced, signal),
-    settled: false,
-    consumed: false,
-  };
-  // 无论成功失败，Promise 落定后都把 `settled` 置 true。
-  handle.promise.then(() => { handle.settled = true; }).catch(() => { handle.settled = true; });
-  return handle;
-}
-
-// 把召回的记忆包成 `<system-reminder>` 片段，注入到用户消息中。
-export function formatMemoriesForInjection(memories: RelevantMemory[]): string {
-  return memories
-    .map((m) => `<system-reminder>\n${m.header}\n\n${m.content}\n</system-reminder>`)
-    .join("\n\n");
-}
-
-// ─── 拼出 system prompt 中的“记忆系统说明”小节 ───────────────
-
-export function buildMemoryPromptSection(): string {
-  const index = loadMemoryIndex();
-  const memoryDir = getMemoryDir();
-
-  // 这段字符串不是实际记忆内容，而是教模型如何正确使用记忆系统。
-  return `# Memory System
-
-You have a persistent, file-based memory system at \`${memoryDir}\`.
-
-## Memory Types
-- **user**: User's role, preferences, knowledge level
-- **feedback**: Corrections and guidance from the user (include Why + How to apply)
-- **project**: Ongoing work, goals, deadlines, decisions
-- **reference**: Pointers to external resources (URLs, tools, dashboards)
-
-## How to Save Memories
-Use the write_file tool to create a memory file with YAML frontmatter:
-
-\`\`\`markdown
----
-name: memory name
-description: one-line description
-type: user|feedback|project|reference
----
-Memory content here.
-\`\`\`
-
-Save to: \`${memoryDir}/\`
-Filename format: \`{type}_{slugified_name}.md\`
-
-The MEMORY.md index is auto-updated when you write to the memory directory — do NOT update it manually.
-
-## What NOT to Save
-- Code patterns or architecture (read the code instead)
-- Git history (use git log)
-- Anything already in CLAUDE.md
-- Ephemeral task details
-
-## When to Recall
-When the user asks you to remember or recall, or when prior context seems relevant.
-${index ? `\n## Current Memory Index\n${index}` : "\n(No memories saved yet.)"}`;
-}
+1. 先执行“步骤 1”，把 `src/memory.ts` 升级到第二阶段。
+2. 再执行“步骤 2”的 `npm run build`。
+3. 最后执行“步骤 3”的测试脚本，确认扫描、manifest 和新鲜度判断都已可用。

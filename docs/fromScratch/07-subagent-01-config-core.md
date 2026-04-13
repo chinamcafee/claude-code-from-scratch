@@ -1,3 +1,31 @@
+# 第 7-1 节：先搭好内置 / 自定义 agent 的配置返回
+
+这一小节结束后，你拿到的不是最终版 `src/subagent.ts`，而是一个已经能返回子代理配置的阶段版。
+
+这个阶段版会先把三类内置 agent、只读工具集、自定义 agent 扫描，以及 `getSubAgentConfig()` 全部接上。
+
+## 本小节目标
+
+1. 导出 `getSubAgentConfig()`。
+2. 能为 `explore`、`plan`、`general` 返回正确的 system prompt 和工具集合。
+3. 能读取 `.claude/agents/*.md` 作为自定义 agent。
+4. 成功编译当前工程。
+
+## 这份阶段版源码来自哪里
+
+这一小节的阶段版 `src/subagent.ts` 完全由参考文件中的这些原始片段拼成：
+
+- 第 1-192 行
+
+## 手把手实操
+
+### 步骤 1：用第一阶段版本覆盖 `src/subagent.ts`
+
+把 `$TARGET_REPO/src/subagent.ts` 整个替换成下面这份阶段版代码。
+
+#### 当前阶段版 `src/subagent.ts` 完整代码
+
+````ts
 // 这个模块负责“子代理”能力：
 // 1. 内置 explore / plan / general 三种 agent 类型。
 // 2. 从 `.claude/agents/*.md` 发现用户自定义 agent。
@@ -190,40 +218,55 @@ export function getSubAgentConfig(type: SubAgentType): SubAgentConfig {
       };
   }
 }
+````
 
-// ─── 构造“可用 agent 类型”说明文本 ──────────────────────────
+### 步骤 2：创建一个最小自定义 agent
 
-export function getAvailableAgentTypes(): { name: string; description: string }[] {
-  // 先放内置 agent，保证顺序稳定。
-  const types: { name: string; description: string }[] = [
-    { name: "explore", description: "Fast, read-only codebase search and exploration" },
-    { name: "plan", description: "Read-only analysis with structured implementation plans" },
-    { name: "general", description: "Full tools for independent tasks" },
-  ];
+```bash
+cd "$TARGET_REPO"
+mkdir -p .claude/agents
+cat > .claude/agents/reviewer.md <<'EOF'
+---
+name: reviewer
+description: review a patch before merge
+allowed-tools: read_file,grep_search
+---
+You are a patch review specialist. Focus on regressions and missing tests.
+EOF
+```
 
-  // 再把自定义 agent 追加进去，让系统提示词能看到扩展能力。
-  for (const [name, def] of discoverCustomAgents()) {
-    types.push({ name, description: def.description });
-  }
+### 步骤 3：先编译
 
-  return types;
+```bash
+cd "$TARGET_REPO"
+npm run build
+```
+
+### 步骤 4：测试内置和自定义 agent 配置
+
+```bash
+cd "$TARGET_REPO"
+node --input-type=module <<'EOF'
+import { getSubAgentConfig } from "./dist/subagent.js";
+
+for (const name of ["explore", "plan", "general", "reviewer"]) {
+  const config = getSubAgentConfig(name);
+  console.log(name, config.tools.map((t) => t.name));
+  console.log(config.systemPrompt.split("\n")[0]);
 }
+EOF
+```
 
-export function buildAgentDescriptions(): string {
-  const types = getAvailableAgentTypes();
-  // 只有内置三种类型时，不必重复注入说明。
-  if (types.length <= 3) return "";
+## 现在你应该看到什么
 
-  // 内置类型已经写死在主 system prompt 里，这里只补充自定义部分。
-  const custom = types.slice(3);
-  const lines = ["\n# Custom Agent Types", ""];
-  for (const t of custom) {
-    lines.push(`- **${t.name}**: ${t.description}`);
-  }
-  return lines.join("\n");
-}
+1. `npm run build` 可以通过。
+2. `explore` 和 `plan` 打印出的工具列表应该只包含只读工具。
+3. `general` 的工具列表里不应该包含 `agent`。
+4. `reviewer` 的工具列表应该只包含你在 frontmatter 里声明的 `read_file` 和 `grep_search`。
 
-// 测试时可手动清空缓存，强制重新发现自定义 agent。
-export function resetAgentCache(): void {
-  cachedCustomAgents = null;
-}
+## 本小节的“手把手测试流程”
+
+1. 先执行“步骤 1”覆盖第一阶段 `src/subagent.ts`。
+2. 再执行“步骤 2”准备一个真实的自定义 agent 文件。
+3. 然后执行“步骤 3”的 `npm run build`。
+4. 最后执行“步骤 4”的脚本，确认内置和自定义 agent 都能返回正确配置。

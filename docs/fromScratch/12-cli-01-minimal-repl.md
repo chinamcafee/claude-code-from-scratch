@@ -1,3 +1,37 @@
+# 第 12-1 节：先接上参数解析、最小 REPL 和主启动流程
+
+这一小节结束后，你拿到的不是最终版 `src/cli.ts`，而是一个“已经能启动、能进 REPL、能退出”的阶段版。
+
+这个阶段版会先把参数解析、最小 REPL 循环、Ctrl+C 处理和主程序入口接起来；内建命令和技能调用放到下一小节再补。
+
+## 本小节目标
+
+1. 支持 `--help`、`--resume`、`--model`、`--max-cost`、`--max-turns` 等参数解析。
+2. 支持最小 REPL：空输入继续等待，`exit` / `quit` 可以退出。
+3. 能进入主启动流程，并在无真实对话时正常退出。
+4. 成功编译当前工程。
+
+## 这份阶段版源码来自哪里
+
+这一小节的阶段版 `src/cli.ts` 完全由参考文件中的这些原始片段拼成：
+
+- 第 1-126 行
+- 第 128-144 行
+- 第 179-219 行
+- 第 310-326 行
+- 第 328-416 行
+
+这里故意先不带 `/clear /plan /cost /compact /memory /skills` 和技能分发那一大段分支逻辑，只保留“可启动的最小 CLI 主骨架”。
+
+## 手把手实操
+
+### 步骤 1：用第一阶段版本覆盖 `src/cli.ts`
+
+把第 1 章里的占位版 `$TARGET_REPO/src/cli.ts` 整个替换成下面这份阶段版代码。
+
+#### 当前阶段版 `src/cli.ts` 完整代码
+
+````ts
 #!/usr/bin/env node
 
 import * as readline from "readline";
@@ -124,7 +158,6 @@ Examples:
     prompt: positional.length > 0 ? positional.join(" ") : undefined,
   };
 }
-
 async function runRepl(agent: Agent) {
   // REPL 的 readline 实例要贯穿整个会话，不能为每次确认都新建一个。
   const rl = readline.createInterface({
@@ -142,40 +175,6 @@ async function runRepl(agent: Agent) {
       });
     });
   });
-
-  // plan 模式退出时，不是简单 yes/no，而是四选一审批流程。
-  agent.setPlanApprovalFn((planContent: string) => {
-    return new Promise((resolve) => {
-      printPlanForApproval(planContent);
-      printPlanApprovalOptions();
-
-      const askChoice = () => {
-        rl.question("  Enter choice (1-4): ", (answer) => {
-          const choice = answer.trim();
-          if (choice === "1") {
-            // 清空上下文后执行，适合长 planning 结束后重新聚焦。
-            resolve({ choice: "clear-and-execute" });
-          } else if (choice === "2") {
-            // 保留上下文继续执行，减少重新解释成本。
-            resolve({ choice: "execute" });
-          } else if (choice === "3") {
-            // 切回正常权限模式，后续编辑仍逐次确认。
-            resolve({ choice: "manual-execute" });
-          } else if (choice === "4") {
-            // 用户反馈会被重新送回模型，让它继续规划。
-            rl.question("  Feedback (what to change): ", (feedback) => {
-              resolve({ choice: "keep-planning", feedback: feedback.trim() || undefined });
-            });
-          } else {
-            console.log("  Invalid choice. Enter 1, 2, 3, or 4.");
-            askChoice();
-          }
-        });
-      };
-      askChoice();
-    });
-  });
-
   // Ctrl+C 逻辑分成两类：
   // 1. 正在执行时，第一次 Ctrl+C 只中断当前请求。
   // 2. 空闲状态下，连续两次 Ctrl+C 才退出整个 REPL。
@@ -217,96 +216,6 @@ async function runRepl(agent: Agent) {
         rl.close();
         process.exit(0);
       }
-
-      // 先拦截 REPL 内建命令。
-      if (input === "/clear") {
-        agent.clearHistory();
-        askQuestion();
-        return;
-      }
-      if (input === "/plan") {
-        // 返回值目前只是给调用者用；这里不用打印，因为 toggle 内部已输出信息。
-        const newMode = agent.togglePlanMode();
-        askQuestion();
-        return;
-      }
-      if (input === "/cost") {
-        agent.showCost();
-        askQuestion();
-        return;
-      }
-      if (input === "/compact") {
-        try {
-          await agent.compact();
-        } catch (e: any) {
-          printError(e.message);
-        }
-        askQuestion();
-        return;
-      }
-      if (input === "/memory") {
-        const memories = listMemories();
-        if (memories.length === 0) {
-          printInfo("No memories saved yet.");
-        } else {
-          // 只打印轻量摘要，不直接展示每条记忆正文。
-          printInfo(`${memories.length} memories:`);
-          for (const m of memories) {
-            console.log(`    [${m.type}] ${m.name} — ${m.description}`);
-          }
-        }
-        askQuestion();
-        return;
-      }
-      if (input === "/skills") {
-        const skills = discoverSkills();
-        if (skills.length === 0) {
-          printInfo("No skills found. Add skills to .claude/skills/<name>/SKILL.md");
-        } else {
-          // 用户可调用的技能显示成 `/name`，自动技能则只显示名字。
-          printInfo(`${skills.length} skills:`);
-          for (const s of skills) {
-            const tag = s.userInvocable ? `/${s.name}` : s.name;
-            console.log(`    ${tag} (${s.source}) — ${s.description}`);
-          }
-        }
-        askQuestion();
-        return;
-      }
-
-      // `/foo xxx` 这种输入优先尝试解释成“手动调用技能”。
-      if (input.startsWith("/")) {
-        const spaceIdx = input.indexOf(" ");
-        const cmdName = spaceIdx > 0 ? input.slice(1, spaceIdx) : input.slice(1);
-        const cmdArgs = spaceIdx > 0 ? input.slice(spaceIdx + 1) : "";
-        const skill = getSkillByName(cmdName);
-        if (skill && skill.userInvocable) {
-          printInfo(`Invoking skill: ${skill.name}`);
-          try {
-            if (skill.context === "fork") {
-              // fork 技能不直接在 CLI 里展开，而是交回 agent 的 `skill` 工具处理，
-              // 这样它内部才能走统一的子代理逻辑。
-              const forkResult = executeSkill(skill.name, cmdArgs);
-              if (forkResult) {
-                await agent.chat(`Use the skill tool to invoke "${skill.name}" with args: ${cmdArgs || "(none)"}`);
-              }
-            } else {
-              // inline 技能直接把 prompt 模板展开后送给当前主代理。
-              const resolved = resolveSkillPrompt(skill, cmdArgs);
-              await agent.chat(resolved);
-            }
-          } catch (e: any) {
-            // 用户主动中断不再重复报错，其余错误统一打印。
-            if (e.name !== "AbortError" && !e.message?.includes("aborted")) {
-              printError(e.message);
-            }
-          }
-          askQuestion();
-          return;
-        }
-        // 如果 `/xxx` 不是已知命令或技能，就把它当普通自然语言输入。
-      }
-
       try {
         await agent.chat(input);
       } catch (e: any) {
@@ -324,7 +233,6 @@ async function runRepl(agent: Agent) {
 
   askQuestion();
 }
-
 async function main() {
   // 所有 CLI 参数都先解析成结构化对象。
   const { permissionMode, model, apiBase, prompt, resume, thinking, maxCost, maxTurns } = parseArgs();
@@ -414,3 +322,32 @@ async function main() {
 
 // CLI 程序入口。
 main();
+````
+
+### 步骤 2：先编译
+
+```bash
+cd "$TARGET_REPO"
+npm run build
+```
+
+### 步骤 3：测试帮助页和最小 REPL
+
+```bash
+cd "$TARGET_REPO"
+node dist/cli.js --help
+
+printf "exit\n" | env ANTHROPIC_API_KEY=dummy node dist/cli.js
+```
+
+## 现在你应该看到什么
+
+1. `npm run build` 可以通过。
+2. `node dist/cli.js --help` 会打印完整帮助页。
+3. 第二条命令会进入一次 REPL，然后在读到 `exit` 后打印 `Bye!` 并退出。
+
+## 本小节的“手把手测试流程”
+
+1. 先执行“步骤 1”，用最小 CLI 阶段版替换占位文件。
+2. 再执行“步骤 2”的 `npm run build`。
+3. 最后执行“步骤 3”的两条命令，确认帮助页和最小 REPL 都已经可用。
